@@ -1,1 +1,1 @@
-just copy and paste the install script in kali linux temninal and click enter
+Run `bash "Install command"` in a Linux shell to generate the Omni-Sentinel backend scaffold and Vite-based React UI.
