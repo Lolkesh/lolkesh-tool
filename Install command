@@ -95,7 +95,7 @@ services:
 
   ui:
     build:
-      context: ../omni-ui-v21.3
+      context: ../omni-ui-v67
       dockerfile: Dockerfile.ui
     restart: unless-stopped
     ports:
@@ -171,9 +171,9 @@ DOCKER
 
 cat > "$UI/package.json" <<'JSON'
 {
-  "name": "omni-ui-v21.3",
+  "name": "omni-ui-v67",
   "private": true,
-  "version": "21.3.0",
+  "version": "67",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -198,7 +198,7 @@ cat > "$UI/index.html" <<'HTML'
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Omni-Sentinel V21.3</title>
+    <title>Omni-Sentinel V67</title>
   </head>
   <body>
     <div id="root"></div>
@@ -427,7 +427,7 @@ NVD_API_KEY = os.getenv("NVD_API_KEY", "")
 def _nvd_fetch(keyword: str) -> list:
     if not keyword or not isinstance(keyword, str):
         return []
-    headers = {"User-Agent": "omni-sentinel/21.3"}
+    headers = {"User-Agent": "omni-sentinel/67"}
     if NVD_API_KEY:
         headers["apiKey"] = NVD_API_KEY
     params = {"keywordSearch": keyword, "resultsPerPage": 5}
@@ -636,7 +636,7 @@ import shutil
 import subprocess
 from typing import Optional
 
-SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/screenshots")
+SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v67/screenshots")
 
 
 def take_screenshot(scan_id: str, port: str, url: str) -> Optional[str]:
