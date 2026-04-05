@@ -15,7 +15,7 @@ warn() {
 mkdir -p "$BASE"/{core,plugins,dashboard,agents,output,scripts,screenshots}
 mkdir -p "$UI/src"
 
-log "OK" "Deploying Omni-Sentinel V21.3 scaffold"
+log "OK" "Deploying Omni-Sentinel V67 scaffold"
 
 if command -v sudo >/dev/null 2>&1; then
   sudo apt update
