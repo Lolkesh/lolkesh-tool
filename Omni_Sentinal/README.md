@@ -5,8 +5,8 @@ This repository provides a modular installer for Omnisential.
 ## Quick Start (clone and run)
 
 ```bash
-git clone <https://github.com/Lolkesh/lolkesh-tool> omnisentinal
-cd omnisentinal
+git clone <https://github.com/Lolkesh/lolkesh-tool> Omni_Sentinal
+cd Omni_Sentinal
 chmod +x install.sh Install_command_v7
 ./install.sh
 ```
