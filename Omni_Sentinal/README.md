@@ -5,8 +5,8 @@ This repository provides a modular installer for Omnisential.
 ## Quick Start (clone and run)
 
 ```bash
-git clone <your-repo-url> omnisential
-cd omnisential
+git clone <your> omnisentinal
+cd omnisentinal
 chmod +x install.sh Install_command_v7
 ./install.sh
 ```
