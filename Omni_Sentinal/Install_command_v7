@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/deps.sh"
+source "${SCRIPT_DIR}/lib/install_state.sh"
+source "${SCRIPT_DIR}/lib/generate.sh"
+
+BASE="${HOME}/omni-sentinal"
+UI="${HOME}/omni-ui"
+
+CHECK_ONLY=0
+SKIP_SYSTEM_DEPS=0
+SKIP_PYTHON_DEPS=0
+DRY_RUN=0
+NO_NETWORK_INSTALL=0
+SAFE_DEFAULTS=1
+FORCE=0
+LEGACY_BACKEND=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./Install_command_v7 [options]
+
+Options:
+  --check-only        Run preflight checks and exit.
+  --dry-run           Show planned actions, no file writes/installs.
+  --no-network-install Skip package manager + pip installation steps.
+  --unsafe-defaults   Disable safe default environment guards.
+  --force             Allow install into existing unmanaged base dir.
+  --legacy-backend    Use Install_command_v6 for file generation.
+  --base-dir PATH     Override base output path (default: ~/omni-sentinal).
+  --ui-dir PATH       Override UI output path (default: ~/omni-ui).
+  --skip-system-deps  Do not auto-install OS packages.
+  --skip-python-deps  Do not install Python packages.
+  -h, --help          Show this help.
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --check-only) CHECK_ONLY=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      --no-network-install) NO_NETWORK_INSTALL=1 ;;
+      --unsafe-defaults) SAFE_DEFAULTS=0 ;;
+      --force) FORCE=1 ;;
+      --legacy-backend) LEGACY_BACKEND=1 ;;
+      --base-dir)
+        shift
+        [ "${1:-}" ] || { warn "--base-dir requires a path"; exit 1; }
+        BASE="$1"
+        ;;
+      --ui-dir)
+        shift
+        [ "${1:-}" ] || { warn "--ui-dir requires a path"; exit 1; }
+        UI="$1"
+        ;;
+      --skip-system-deps) SKIP_SYSTEM_DEPS=1 ;;
+      --skip-python-deps) SKIP_PYTHON_DEPS=1 ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        warn "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
+print_plan() {
+  log "PLAN" "Install_command_v7 dry-run summary"
+  printf '  - Base path: %s\n' "$BASE"
+  printf '  - UI path: %s\n' "$UI"
+  printf '  - check-only: %s\n' "$CHECK_ONLY"
+  printf '  - dry-run: %s\n' "$DRY_RUN"
+  printf '  - skip-system-deps: %s\n' "$SKIP_SYSTEM_DEPS"
+  printf '  - skip-python-deps: %s\n' "$SKIP_PYTHON_DEPS"
+  printf '  - no-network-install: %s\n' "$NO_NETWORK_INSTALL"
+  printf '  - safe-defaults: %s\n' "$SAFE_DEFAULTS"
+  printf '  - force: %s\n' "$FORCE"
+  printf '  - generation mode: %s\n' "$([ "$LEGACY_BACKEND" -eq 1 ] && echo legacy-v6 || echo templates-v7)"
+}
+
+apply_safe_defaults() {
+  if [ "$SAFE_DEFAULTS" -eq 0 ]; then
+    warn "Safe defaults disabled (--unsafe-defaults)"
+    return 0
+  fi
+
+  # Export conservative defaults that backend components can opt into.
+  export OMNI_SAFE_MODE=1
+  export OMNI_DISABLE_INSECURE_TLS=1
+  export OMNI_SKIP_SENSITIVE_PLUGINS=1
+  log "OK" "Safe defaults enabled (OMNI_SAFE_MODE=1)"
+}
+
+run_generator_backend() {
+  local legacy_script="${SCRIPT_DIR}/Install_command_v6"
+  if [ ! -f "$legacy_script" ]; then
+    warn "Legacy generator backend not found: $legacy_script"
+    exit 1
+  fi
+
+  # Prevent duplicate dependency installs; v7 handles dependency phase.
+  local args=(--skip-system-deps --skip-python-deps)
+  step "Delegating file generation to legacy backend"
+  run_cmd bash "$legacy_script" "${args[@]}"
+}
+
+main() {
+  parse_args "$@"
+  init_install_state
+  trap 'write_manifest "failed"' ERR
+
+  if [ "$NO_NETWORK_INSTALL" -eq 1 ]; then
+    SKIP_SYSTEM_DEPS=1
+    SKIP_PYTHON_DEPS=1
+    warn "Network installs disabled (--no-network-install): skipping system and Python deps"
+  fi
+
+  apply_safe_defaults
+
+  step "Preflight and dependency phase"
+  install_system_deps
+  check_runtime_dependencies
+  ensure_python_packages \
+    fastapi uvicorn celery redis python-dotenv bcrypt PyJWT requests \
+    python-nmap cryptography fpdf2 markdown2 schedule dnspython
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    log "OK" "Preflight checks passed (--check-only). Exiting before file generation."
+    trap - ERR
+    exit 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    step "Dry-run requested"
+    print_plan
+    log "OK" "Dry-run complete. No changes were made."
+    exit 0
+  fi
+
+  ensure_base_is_safe
+  step "Creating backup and install manifest"
+  backup_existing_base
+
+  step "Ensuring project directories"
+  run_cmd mkdir -p "$BASE"/{core,plugins,dashboard,agents,output,scripts,screenshots}
+  run_cmd mkdir -p "$UI/src"
+  run_cmd touch "$BASE/.omni-managed"
+
+  if [ "$LEGACY_BACKEND" -eq 1 ]; then
+    run_generator_backend
+  else
+    generate_from_templates
+  fi
+  trap - ERR
+  write_manifest "success"
+  log "OK" "Install_command_v7 completed"
+}
+
+main "$@"

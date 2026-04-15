@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api:
+    image: python:3.11-slim
+    working_dir: /app
+    command: sh -c "pip install -r requirements.txt && uvicorn dashboard.app:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=__SECRET_KEY__
+      - ADMIN_PASSWORD=__ADMIN_PASSWORD__
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ui:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    volumes:
+      - __UI__:/app
+    ports:
+      - "5173:5173"
